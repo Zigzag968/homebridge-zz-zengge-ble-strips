@@ -1,6 +1,7 @@
 import { Buffer } from 'buffer';
 import noble, { Peripheral } from '@abandonware/noble';
 import { API, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service, CharacteristicEventTypes, CharacteristicValue, HAP } from 'homebridge';
+import { exec } from 'child_process';
 
 const PLATFORM_NAME = "HomebridgeZzZenggeBleStrips";
 
@@ -33,6 +34,9 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
   private readonly accessories: PlatformAccessory[] = [];
   private readonly homebridge: API;
 
+  private bluetoothSwitchAccessory: PlatformAccessory | null = null;
+  private bluetoothEnabled: boolean = true;
+
   constructor(log: Logger, config: PlatformConfig, homebridge: API) {
     this.log = log;
     this.config = config;
@@ -44,8 +48,6 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
         return;
       }
       log.info('ZenggeLedStrip platform initializing...');
-
-      const accessoriesToRegister: PlatformAccessory[] = [];
 
       config.devices.forEach((deviceConfig: any) => {
         const address = deviceConfig.address;
@@ -65,32 +67,37 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
         // Create or retrieve the accessory
         let accessory = this.accessories.find(accessory => accessory.UUID === uuid);
         if (!accessory) {
-         // Create new accessory
-  accessory = new this.homebridge.platformAccessory(name, uuid);
-  accessory.context.deviceAddress = address;
-  // You can also store the entire deviceConfig if needed
-  accessory.context.deviceConfig = deviceConfig;
+          // Create new accessory
+          accessory = new this.homebridge.platformAccessory(name, uuid);
+          accessory.context.deviceAddress = address;
+          accessory.context.deviceConfig = deviceConfig;
 
-  // Create and assign the controller
-  const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
-  accessory.context.controller = controller;
+          // Create and assign the controller
+          const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
+          accessory.context.controller = controller;
 
-  // Launch the accessory
-  controller.configure(accessory);
+          // Configure the accessory
+          controller.configure(accessory);
 
-  // Register the accessory
-  this.homebridge.registerPlatformAccessories('homebridge-zz-zengge-ble-strips', PLATFORM_NAME, [accessory]);
+          // Register the accessory
+          this.homebridge.registerPlatformAccessories('homebridge-zz-zengge-ble-strips', PLATFORM_NAME, [accessory]);
 
-  // Add to accessories list
-  this.accessories.push(accessory);
+          // Add to accessories list
+          this.accessories.push(accessory);
         } else {
           this.log.info(`Accessory ${accessory.displayName} is cached.`);
+          const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
+          accessory.context.controller = controller;
+          controller.configure(accessory);
+          this.accessories.push(accessory);
         }
-
-        this.accessories.push(accessory);
       });
 
-      this.initialize();
+      // Initialize the Host Bluetooth switch accessory
+      this.initializeBluetoothSwitchAccessory();
+
+      // Set up Noble observers
+      this.setupNobleObservers();
 
       log.info('Initialization complete.');
     });
@@ -98,61 +105,78 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
 
   configureAccessory(accessory: PlatformAccessory) {
     this.log.info(`Configuring cached accessory: ${accessory.displayName}`);
-  
+
+    if (accessory.context.isHostBluetoothSwitch) {
+      // This is the Host Bluetooth switch accessory
+      this.bluetoothSwitchAccessory = accessory;
+      this.configureBluetoothSwitchAccessory(accessory);
+      this.accessories.push(accessory);
+      return;
+    }
+
     // Retrieve the device address
     const deviceAddress = accessory.context.deviceAddress;
-  
+
     if (!deviceAddress) {
       this.log.error('No deviceAddress found in context for accessory:', accessory.displayName);
       return;
     }
-  
+
     // Find the device configuration from the platform config
     let deviceConfig = this.config.devices.find((device: any) => device.address === deviceAddress);
 
-  // Concatenate trames from platform config and device config
-  deviceConfig.trames = [
-    ...(this.config.trames || []),
-    ...(deviceConfig.trames || [])
-  ];
-  
+    // Concatenate trames from platform config and device config
+    deviceConfig.trames = [
+      ...(this.config.trames || []),
+      ...(deviceConfig.trames || [])
+    ];
+
     if (!deviceConfig) {
       this.log.warn(`No device configuration found for deviceAddress ${deviceAddress}.`);
       return;
     }
-  
+
     // Recreate the controller
     const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
-  
+
     // Assign the controller to the accessory context
     accessory.context.controller = controller;
-  
-    // Launch the accessory
+
+    // Configure the accessory
     controller.configure(accessory);
-  
+
     // Add the accessory to your internal list
     this.accessories.push(accessory);
   }
 
-  async initialize() {
+  async setupNobleObservers() {
     noble.on('stateChange', async (state) => {
+      this.log.info(`Bluetooth adapter state changed to: ${state}`);
       if (state === 'poweredOn') {
-        this.log.info('Starting scan for devices...');
-        this.startBluetoothScanning();
+        if (this.bluetoothEnabled) {
+          this.log.info('Bluetooth adapter is powered on. Starting scanning...');
+          this.startBluetoothScanning();
+        } else {
+          this.log.info('Bluetooth is disabled in the plugin. Not starting scanning.');
+        }
       } else {
         noble.stopScanning();
-        this.log.warn('Bluetooth adapter not powered on.');
+        this.log.warn(`Bluetooth adapter state is ${state}. Scanning stopped.`);
       }
     });
 
     noble.on('discover', async (peripheral: Peripheral) => {
-      const accessory = this.accessories.find(accessory => accessory.context.controller.deviceAddress.toLowerCase() === peripheral.address.toLowerCase());
+      if (!this.bluetoothEnabled) {
+        this.log.info('Host Bluetooth is disabled. Ignoring discovered devices.');
+        return;
+      }
+
+      const accessory = this.accessories.find(accessory => accessory.context.controller && accessory.context.controller.deviceAddress.toLowerCase() === peripheral.address.toLowerCase());
       if (accessory) {
         this.log.info(`Found registered device: ${peripheral.address}`);
         await accessory.context.controller.connectToDevice(peripheral).then(() => {
           this.startBluetoothScanning();
-        })
-        // noble.stopScanning(); // Uncomment if you want to stop scanning after finding the device
+        });
       }
     });
 
@@ -162,7 +186,90 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
   }
 
   startBluetoothScanning() {
+    if (!this.bluetoothEnabled) {
+      this.log.info('Host Bluetooth is disabled. Not starting scanning.');
+      return;
+    }
     noble.startScanning([], false);  // Scan all devices
+    this.log.info('Started Bluetooth scanning.');
+  }
+
+  private initializeBluetoothSwitchAccessory() {
+    const uuid = this.homebridge.hap.uuid.generate('HostBluetoothSwitch');
+    let accessory = this.accessories.find(accessory => accessory.UUID === uuid);
+
+    if (accessory) {
+      this.log.info('Host Bluetooth Switch accessory already exists.');
+      this.bluetoothSwitchAccessory = accessory;
+      this.configureBluetoothSwitchAccessory(accessory);
+    } else {
+      accessory = new this.homebridge.platformAccessory('Host Bluetooth', uuid);
+      accessory.category = hap.Categories.SWITCH;
+
+      this.configureBluetoothSwitchAccessory(accessory);
+
+      // Register the accessory
+      this.homebridge.registerPlatformAccessories('homebridge-zz-zengge-ble-strips', PLATFORM_NAME, [accessory]);
+
+      this.bluetoothSwitchAccessory = accessory;
+      this.accessories.push(accessory);
+    }
+  }
+
+  private configureBluetoothSwitchAccessory(accessory: PlatformAccessory) {
+    const switchService = accessory.getService(hap.Service.Switch) ||
+      accessory.addService(hap.Service.Switch, 'Host Bluetooth', 'host-bluetooth-switch');
+
+    switchService.getCharacteristic(hap.Characteristic.On)
+      .onSet(this.setHostBluetoothEnabled.bind(this))
+      .onGet(this.getHostBluetoothEnabled.bind(this));
+
+    // Set accessory information
+    accessory.getService(hap.Service.AccessoryInformation)!
+      .setCharacteristic(hap.Characteristic.Manufacturer, 'YourCompany')
+      .setCharacteristic(hap.Characteristic.Model, 'Host Bluetooth Switch')
+      .setCharacteristic(hap.Characteristic.SerialNumber, 'HB-001');
+
+    // Update accessory context
+    accessory.context.isHostBluetoothSwitch = true;
+  }
+
+  private async setHostBluetoothEnabled(value: CharacteristicValue) {
+    this.bluetoothEnabled = value as boolean;
+    this.log.info(`Host Bluetooth enabled set to: ${this.bluetoothEnabled}`);
+  
+    if (this.bluetoothEnabled) {
+      exec('sudo /usr/local/bin/enable_bluetooth.sh', (error, stdout, stderr) => {
+        if (error) {
+          this.log.error(`Error enabling Bluetooth: ${error.message}`);
+          return;
+        }
+        this.log.info('Bluetooth enable script executed.');
+        // Wait for 'stateChange' event to start scanning
+      });
+    } else {
+      exec('sudo /usr/local/bin/disable_bluetooth.sh', (error, stdout, stderr) => {
+        if (error) {
+          this.log.error(`Error disabling Bluetooth: ${error.message}`);
+          return;
+        }
+        this.log.info('Bluetooth disable script executed.');
+        noble.stopScanning();
+      });
+    }
+  }
+
+  private async getHostBluetoothEnabled(): Promise<CharacteristicValue> {
+    return new Promise((resolve, reject) => {
+      exec('rfkill list bluetooth', (error: any, stdout: any, stderr: any) => {
+        if (error) {
+          this.log.error(`Error checking Bluetooth status: ${error.message}`);
+          return reject(error);
+        }
+        const isBlocked = stdout.includes('Soft blocked: yes') || stdout.includes('Hard blocked: yes');
+        resolve(!isBlocked);
+      });
+    });
   }
 }
 
@@ -222,13 +329,17 @@ class ZenggeLedStripPlatformAccessory {
 
   private createPowerSwitchService(accessory: PlatformAccessory) {
     this.onService = accessory.getService('Power') ||
-      accessory.addService(hap.Service.Lightbulb, 'Power', 'power');
-
+      accessory.addService(hap.Service.Lightbulb, 'Power', 'power'); 
+    
     // Set up characteristics for On Lightbulb service
     this.onService.setCharacteristic(hap.Characteristic.Name, 'power');
     this.onService.getCharacteristic(hap.Characteristic.On)
       .onSet(this.setOn.bind(this))
       .onGet(this.getOn.bind(this));
+
+        // Mark the power switch service as the primary service
+
+      this.onService.setPrimaryService(true);
   }
 
   private createTrameSwitchServices(accessory: PlatformAccessory) {
