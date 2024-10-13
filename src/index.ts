@@ -23,7 +23,8 @@ type AccessoryInfo = {
 
 type DeviceConfig = {
   name: string,
-  address: string
+  address: string,
+  trames: { name: string, trame: string }[]
 };
 
 class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
@@ -107,7 +108,13 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
     }
   
     // Find the device configuration from the platform config
-    const deviceConfig = this.config.devices.find((device: any) => device.address === deviceAddress);
+    let deviceConfig = this.config.devices.find((device: any) => device.address === deviceAddress);
+
+  // Concatenate trames from platform config and device config
+  deviceConfig.trames = [
+    ...(this.config.trames || []),
+    ...(deviceConfig.trames || [])
+  ];
   
     if (!deviceConfig) {
       this.log.warn(`No device configuration found for deviceAddress ${deviceAddress}.`);
@@ -163,17 +170,22 @@ class ZenggeLedStripPlatformAccessory {
   private readonly logger: Logger;
   private readonly name: string;
   readonly deviceAddress: string;
-  private isOn: boolean = false;
   private peripheral: Peripheral | null = null;
   private ledCharacteristic: any;
   private counter: number = 0;
-  private onService!: Service;
-  private redService!: Service;
 
-  constructor(logger: Logger, config: any) {
+  private isOn: boolean = false;
+  private onService!: Service;
+  private trames: { name: string; trame: string }[] = [];
+  private trameStates: { [key: string]: boolean } = {};
+  private trameServices: { [key: string]: Service } = {};
+
+  constructor(logger: Logger, config: DeviceConfig) {
     this.logger = logger;
     this.name = config.name || 'Zengge LED Strip';
+    this.trames = config.trames || [];
     this.deviceAddress = config.address;
+    this.log('Trames:', this.trames);
   }
 
   log(...messages: any[]) {
@@ -181,30 +193,21 @@ class ZenggeLedStripPlatformAccessory {
     this.logger.info(`[${this.name}] ${message}`);
   }
 
+  error(...messages: any[]) {
+    const message = messages.map(msg => typeof msg === 'object' ? JSON.stringify(msg) : msg).join(' ');
+    this.logger.error(`[${this.name}] ${message}`);
+  }
+
   configure(accessory: PlatformAccessory) {
     // Set accessory category
     accessory.category = hap.Categories.LIGHTBULB; // or SWITCH
   
     // Get or create the On Lightbulb service
-    this.onService = accessory.getService('On Lightbulb') ||
-      accessory.addService(hap.Service.Lightbulb, 'On Lightbulb', 'on-lightbulb');
-  
-    // Get or create the Red Lightbulb service
-    this.redService = accessory.getService('Red Lightbulb') ||
-      accessory.addService(hap.Service.Lightbulb, 'Red Lightbulb', 'red-lightbulb');
-  
-    // Set up characteristics for On Lightbulb service
-    this.onService.setCharacteristic(hap.Characteristic.Name, 'On Lightbulb');
-    this.onService.getCharacteristic(hap.Characteristic.On)
-      .onSet(this.setOn.bind(this))
-      .onGet(this.getOn.bind(this));
-  
-    // Set up characteristics for Red Lightbulb service
-    this.redService.setCharacteristic(hap.Characteristic.Name, 'Red Lightbulb');
-    this.redService.getCharacteristic(hap.Characteristic.On)
-      .onSet(this.setRed.bind(this))
-      .onGet(this.getRed.bind(this));
-  
+    this.createPowerSwitchService(accessory);
+    
+    // Create switches for each trame
+    this.createTrameSwitchServices(accessory);
+
     // Set accessory information
     const accessoryInfoService = accessory.getService(hap.Service.AccessoryInformation);
     if (accessoryInfoService) {
@@ -215,22 +218,51 @@ class ZenggeLedStripPlatformAccessory {
     } else {
       this.logger.error('Accessory Information Service not found');
     }
-  
-  
-      // this.peripheral.on('disconnect', () => {
-      //   this.log('Device disconnected');
-      //   this.peripheral = null;
-      //   this.connectToDevice(this.peripheral);
-      // });
+  }
+
+  private createPowerSwitchService(accessory: PlatformAccessory) {
+    this.onService = accessory.getService('Power') ||
+      accessory.addService(hap.Service.Lightbulb, 'Power', 'power');
+
+    // Set up characteristics for On Lightbulb service
+    this.onService.setCharacteristic(hap.Characteristic.Name, 'power');
+    this.onService.getCharacteristic(hap.Characteristic.On)
+      .onSet(this.setOn.bind(this))
+      .onGet(this.getOn.bind(this));
+  }
+
+  private createTrameSwitchServices(accessory: PlatformAccessory) {
+    this.log('Creating trame switch services...', this.trames.map((trame: any) => trame.name).join(', '));
+    this.trames.forEach(trame => {
+      const trameName = trame.name;
+      const serviceName = trameName;
+      const serviceSubType = `trame-${Buffer.from(trameName).toString('hex')}`;
+
+      // Get or create the trame switch service
+      const trameService = accessory.getService(serviceName) ||
+        accessory.addService(hap.Service.Switch, serviceName, serviceSubType);
+
+      // Set the Name characteristic
+      trameService.setCharacteristic(hap.Characteristic.Name, trameName);
+
+      // Set up characteristics for the trame switch
+      trameService.getCharacteristic(hap.Characteristic.On)
+        .onSet(this.setTrame.bind(this, trameName))
+        .onGet(this.getTrame.bind(this, trameName));
+
+      // Initialize trame state
+      this.trameStates[trameName] = false;
+      this.trameServices[trameName] = trameService;
+    });
   }
 
   async onConnected() {
     await this.setPower(true);  // Turn on the LEDs
     await this.setPattern(1);  // Change color to red
-    await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
-    await this.setPattern(2);  // Change color to another pattern
-    await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
-    await this.setPattern(3);  // Change color to another pattern
+    // await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
+    // await this.setPattern(2);  // Change color to another pattern
+    // await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
+    // await this.setPattern(3);  // Change color to another pattern
   }
 
   async connectToDevice(peripheral: Peripheral) {
@@ -333,6 +365,7 @@ class ZenggeLedStripPlatformAccessory {
     const offBuffer = Buffer.from("005b8000000d0e0b3b240000000000000032000091", "hex");
     const command = value ? onBuffer : offBuffer;  // Turn on/off command
     await this.sendCommand(command);
+    this.onService.updateCharacteristic(hap.Characteristic.On, value);
     this.log('Power state set to:', value);
   }
 
@@ -385,15 +418,77 @@ class ZenggeLedStripPlatformAccessory {
 async getOn(): Promise<CharacteristicValue> {
   return this.isOn;
 }
+async setTrame(trameName: string, value: CharacteristicValue): Promise<void> {
+  this.log(`Setting trame '${trameName}' to:`, value);
+  return new Promise(async (resolve, reject) => {
+    try {
+      const boolValue = value as boolean;
 
-async setRed(value: CharacteristicValue): Promise<void> {
-  const boolValue = value as boolean;
-  this.isOn = boolValue;
-  this.log('Power state set to:', boolValue);
-  await this.setPower(boolValue);
+      if (boolValue) {
+        // Turn on this trame
+        this.trameStates[trameName] = true;
+        this.log(`Trame '${trameName}' switch turned ON`);
+
+        // Send the trame command to the LED strip
+        const trame = this.trames.find(t => t.name === trameName);
+        if (trame) {
+          const commandBuffer = Buffer.from(trame.trame, 'hex');
+          await this.sendCommand(commandBuffer);
+          this.log(`Sent trame command for '${trameName}'`);
+        } else {
+          this.log(`Trame '${trameName}' not found in configuration`);
+          return reject(`Trame '${trameName}' not found in configuration`);
+        }
+
+        // Turn off other trame switches
+        this.turnOffOtherTrames(trameName);
+
+        // Ensure the power switch is ON
+        if (!this.isOn) {
+          await this.setPower(true);
+        }
+
+      } else {
+        // Turning off this trame switch, turn off the LED strip
+        await this.setPower(false);
+        this.trameStates[trameName] = false;
+        this.log(`Trame '${trameName}' switch turned OFF`);
+
+        // Update the power switch state
+        if (this.isOn) {
+          this.isOn = false;
+          this.onService.updateCharacteristic(hap.Characteristic.On, false);
+          this.log('Power switch turned OFF');
+        }
+      }
+      resolve();
+    } catch (error) {
+      this.logger.error('Error in setTrame:', error);
+      reject(error);
+    }
+  });
 }
 
-async getRed(): Promise<CharacteristicValue> {
-return this.isOn;
+  private turnOffOtherTrames(trameName: string) {
+    for (const otherTrameName of Object.keys(this.trameStates)) {
+      if (otherTrameName !== trameName) {
+        if (this.trameStates[otherTrameName]) {
+          this.trameStates[otherTrameName] = false;
+          const service = this.trameServices[otherTrameName];
+
+          try {
+            service.updateCharacteristic(hap.Characteristic.On, false);
+            this.log(`Trame '${otherTrameName}' switch turned OFF`);
+          } catch (error) {
+            this.error(`Error updating characteristic for trame '${otherTrameName}':`, error);
+          }
+        }
+      }
+    }
+  }
+
+async getTrame(trameName: string): Promise<CharacteristicValue> {
+  return this.trameStates[trameName] || false;
 }
 }
+
