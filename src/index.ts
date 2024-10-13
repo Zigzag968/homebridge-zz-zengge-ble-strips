@@ -302,7 +302,7 @@ class ZenggeLedStripPlatformAccessory {
 
   error(...messages: any[]) {
     const message = messages.map(msg => typeof msg === 'object' ? JSON.stringify(msg) : msg).join(' ');
-    this.logger.error(`[${this.name}] ${message}`);
+    this.logger.error(`[${this.name}] ${message}`); 
   }
 
   configure(accessory: PlatformAccessory) {
@@ -321,7 +321,8 @@ class ZenggeLedStripPlatformAccessory {
       accessoryInfoService
         .setCharacteristic(hap.Characteristic.Manufacturer, 'Zengge')
         .setCharacteristic(hap.Characteristic.Model, PLATFORM_NAME)
-        .setCharacteristic(hap.Characteristic.SerialNumber, this.deviceAddress);
+        .setCharacteristic(hap.Characteristic.SerialNumber, this.deviceAddress)
+        .setCharacteristic(hap.Characteristic.Name, this.name); // Add this line
     } else {
       this.logger.error('Accessory Information Service not found');
     }
@@ -329,10 +330,10 @@ class ZenggeLedStripPlatformAccessory {
 
   private createPowerSwitchService(accessory: PlatformAccessory) {
     this.onService = accessory.getService('Power') ||
-      accessory.addService(hap.Service.Lightbulb, 'Power', 'power'); 
+    accessory.addService(hap.Service.Lightbulb, 'Power', 'power-service');
     
     // Set up characteristics for On Lightbulb service
-    this.onService.setCharacteristic(hap.Characteristic.Name, 'power');
+    this.onService.setCharacteristic(hap.Characteristic.Name, 'Power');
     this.onService.getCharacteristic(hap.Characteristic.On)
       .onSet(this.setOn.bind(this))
       .onGet(this.getOn.bind(this));
@@ -378,9 +379,12 @@ class ZenggeLedStripPlatformAccessory {
 
   async connectToDevice(peripheral: Peripheral) {
     try {
-      await this.peripheralConnect(peripheral);
-      await this.discoverLedCharacteristic(peripheral);
-      await this.enableNotifications(peripheral);
+      await this.peripheralConnect(peripheral).then(async () => {
+        setTimeout(async () => {
+          await this.discoverLedCharacteristic(peripheral);
+          await this.enableNotifications(peripheral);
+        }, 500);
+      });
       this.log('Device setup complete.');
       this.log(`Peripheral found: ${peripheral}`);
       this.peripheral = peripheral;
