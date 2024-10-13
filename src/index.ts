@@ -17,7 +17,7 @@ module.exports = (homebridge: API) => {
 
 type AccessoryInfo = {
   uuid: string,
-  homebridgeAccessory: () => PlatformAccessory,
+  homebridgeAccessory: PlatformAccessory,
   controller: ZenggeLedStripPlatformAccessory
 };
 
@@ -39,66 +39,92 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
 
     homebridge.on('didFinishLaunching', () => {
       if (!config.devices) {
-        log.error("No devices configured");
+        log.error('No devices configured');
         return;
       }
-      log.info("ZenggeLedStrip platform initializing...");
+      log.info('ZenggeLedStrip platform initializing...');
 
-      const accessories = config.devices.map((deviceConfig: any) => {
+      const accessoriesToRegister: PlatformAccessory[] = [];
+
+      config.devices.forEach((deviceConfig: any) => {
         const address = deviceConfig.address;
         const name = deviceConfig.name;
+
         if (!address) {
           log.error('Missing device address in configuration.');
-          return null;
+          return;
         }
         if (!name) {
           log.error('Missing device name in configuration.');
-          return null;
+          return;
         }
 
-        const uuid = homebridge.hap.uuid.generate(address);
+        const uuid = homebridge.hap.uuid.generate(`${address}`);
 
-        const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
+        // Create or retrieve the accessory
+        let accessory = this.accessories.find(accessory => accessory.UUID === uuid);
+        if (!accessory) {
+         // Create new accessory
+  accessory = new this.homebridge.platformAccessory(name, uuid);
+  accessory.context.deviceAddress = address;
+  // You can also store the entire deviceConfig if needed
+  accessory.context.deviceConfig = deviceConfig;
 
-        const homebridgeAccessory = () => {
-          const cachedAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
-          if (cachedAccessory) {
-            cachedAccessory.context.controller = controller;
-            return cachedAccessory;
-          }
+  // Create and assign the controller
+  const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
+  accessory.context.controller = controller;
 
-          const accessory = new homebridge.platformAccessory(name, uuid);
-          accessory.context.controller = controller;
-          accessory.context.deviceAddress = address;
-          homebridge.registerPlatformAccessories("homebridge-zz-zengge-ble-strips", PLATFORM_NAME, [accessory]);
+  // Launch the accessory
+  controller.configure(accessory);
 
-          return accessory;
-        };
+  // Register the accessory
+  this.homebridge.registerPlatformAccessories('homebridge-zz-zengge-ble-strips', PLATFORM_NAME, [accessory]);
 
-        return {
-          uuid: uuid,
-          homebridgeAccessory: homebridgeAccessory,
-          controller: controller,
-        };
-      }).filter((accessory: AccessoryInfo | null): accessory is AccessoryInfo => accessory !== null) as AccessoryInfo[];
+  // Add to accessories list
+  this.accessories.push(accessory);
+        } else {
+          this.log.info(`Accessory ${accessory.displayName} is cached.`);
+        }
+
+        this.accessories.push(accessory);
+      });
+
+      this.initialize();
 
       log.info('Initialization complete.');
-      log.info('Registering accessories:', accessories.map(accessory => accessory.homebridgeAccessory().displayName).join(', '));
-      accessories.forEach(accessory => {
-        accessory.controller.launchWithAccessory(accessory.homebridgeAccessory());
-      });
-      this.initialize().catch(error => {
-        log.error('Error during initialization:', error);
-      });
     });
   }
 
   configureAccessory(accessory: PlatformAccessory) {
-    this.accessories.push(accessory);
-    const deviceConfig = accessory.context.deviceConfig;
-    if (deviceConfig) {
-      accessory.context.controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
+    this.log.info(`Configuring cached accessory: ${accessory.displayName}`);
+  
+    // Retrieve the device address
+    const deviceAddress = accessory.context.deviceAddress;
+  
+    if (!deviceAddress) {
+      this.log.error('No deviceAddress found in context for accessory:', accessory.displayName);
+      return;
     }
+  
+    // Find the device configuration from the platform config
+    const deviceConfig = this.config.devices.find((device: any) => device.address === deviceAddress);
+  
+    if (!deviceConfig) {
+      this.log.warn(`No device configuration found for deviceAddress ${deviceAddress}.`);
+      return;
+    }
+  
+    // Recreate the controller
+    const controller = new ZenggeLedStripPlatformAccessory(this.log, deviceConfig);
+  
+    // Assign the controller to the accessory context
+    accessory.context.controller = controller;
+  
+    // Launch the accessory
+    controller.configure(accessory);
+  
+    // Add the accessory to your internal list
+    this.accessories.push(accessory);
   }
 
   async initialize() {
@@ -155,33 +181,42 @@ class ZenggeLedStripPlatformAccessory {
     this.logger.info(`[${this.name}] ${message}`);
   }
 
-  launchWithAccessory(accessory: PlatformAccessory) {
-    // this.onService = new hap.Service.Lightbulb(this.name, 'on switch');
-    this.redService = new hap.Service.Lightbulb(this.name, 'red switch');
-
-     // get the LightBulb service if it exists
-     let service = accessory.getService('on switch');
-     //this.redService = accessory.getService(Service.Lightbulb, 'red switch');
-
-     // otherwise create a new LightBulb service
-     if (!service) {
-      service = accessory.addService(hap.Service.Lightbulb, 'on switch', 'On');
-     }
-
-     service.getCharacteristic(hap.Characteristic.On)
-    .onSet(this.setOn.bind(this))
-    .onGet(this.getOn.bind(this));
-
-this.redService.getCharacteristic(hap.Characteristic.On)
-    .onSet(this.setOn.bind(this))
-    .onGet(this.getOn.bind(this));
-
-    accessory.getService(hap.Service.AccessoryInformation)!
-      .setCharacteristic(hap.Characteristic.Manufacturer, 'Zengge')
-      .setCharacteristic(hap.Characteristic.Model, PLATFORM_NAME)
-      .setCharacteristic(hap.Characteristic.SerialNumber, this.deviceAddress);
-
-
+  configure(accessory: PlatformAccessory) {
+    // Set accessory category
+    accessory.category = hap.Categories.LIGHTBULB; // or SWITCH
+  
+    // Get or create the On Lightbulb service
+    this.onService = accessory.getService('On Lightbulb') ||
+      accessory.addService(hap.Service.Lightbulb, 'On Lightbulb', 'on-lightbulb');
+  
+    // Get or create the Red Lightbulb service
+    this.redService = accessory.getService('Red Lightbulb') ||
+      accessory.addService(hap.Service.Lightbulb, 'Red Lightbulb', 'red-lightbulb');
+  
+    // Set up characteristics for On Lightbulb service
+    this.onService.setCharacteristic(hap.Characteristic.Name, 'On Lightbulb');
+    this.onService.getCharacteristic(hap.Characteristic.On)
+      .onSet(this.setOn.bind(this))
+      .onGet(this.getOn.bind(this));
+  
+    // Set up characteristics for Red Lightbulb service
+    this.redService.setCharacteristic(hap.Characteristic.Name, 'Red Lightbulb');
+    this.redService.getCharacteristic(hap.Characteristic.On)
+      .onSet(this.setRed.bind(this))
+      .onGet(this.getRed.bind(this));
+  
+    // Set accessory information
+    const accessoryInfoService = accessory.getService(hap.Service.AccessoryInformation);
+    if (accessoryInfoService) {
+      accessoryInfoService
+        .setCharacteristic(hap.Characteristic.Manufacturer, 'Zengge')
+        .setCharacteristic(hap.Characteristic.Model, PLATFORM_NAME)
+        .setCharacteristic(hap.Characteristic.SerialNumber, this.deviceAddress);
+    } else {
+      this.logger.error('Accessory Information Service not found');
+    }
+  
+  
       // this.peripheral.on('disconnect', () => {
       //   this.log('Device disconnected');
       //   this.peripheral = null;
@@ -349,5 +384,16 @@ this.redService.getCharacteristic(hap.Characteristic.On)
 
 async getOn(): Promise<CharacteristicValue> {
   return this.isOn;
+}
+
+async setRed(value: CharacteristicValue): Promise<void> {
+  const boolValue = value as boolean;
+  this.isOn = boolValue;
+  this.log('Power state set to:', boolValue);
+  await this.setPower(boolValue);
+}
+
+async getRed(): Promise<CharacteristicValue> {
+return this.isOn;
 }
 }
