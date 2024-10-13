@@ -9,7 +9,7 @@ const Buffer = require('buffer').Buffer;
 const noble = require('@abandonware/noble');
 
 const PLATFORM_NAME = "HomebridgeZzZenggeBleStrips";
-let Service, Characteristic, CharacteristicEventTypes;
+let Service, Characteristic, CharacteristicEventTypes, PlatformAccessory
 
 let hap;
 
@@ -17,6 +17,7 @@ module.exports = function (homebridge) {
     Service = homebridge.hap.Service;
     Characteristic = homebridge.hap.Characteristic;
     CharacteristicEventTypes = homebridge.hap.CharacteristicEventTypes;
+    PlatformAccessory = homebridge.platformAccessory;
     hap = homebridge.hap;
     homebridge.registerPlatform(PLATFORM_NAME, ZenggeLedStripPlatform);
 };
@@ -25,55 +26,73 @@ class ZenggeLedStripPlatform {
 
     log;
     config;
+    accessories;
+    homebridge;
 
     constructor(log, config, homebridge) {
+
         this.log = log;
         this.config = config;
-        log.info("ZenggeLedStrip platform initialized!");
-    }
+        this.homebridge = homebridge;
+        this.accessories = [];
+    
+        /**
+         * Platforms should wait until the "didFinishLaunching" event has fired before
+         * registering any new accessories.
+         */
+        homebridge.on('didFinishLaunching', () => {
+          
+          if(!config.devices) {
+            log.error("No devices configured");
+            return;
+          }
+          log.info("ZenggeLedStrip platform initializing...");
 
-    accessories(callback) {
-        callback([
-            new ZenggeLedStripAccessory(this.log, this.config),
-        ]);
-    }
+          const accessories = config.devices.map(deviceConfig => {
+                const address = deviceConfig.address;
+                const name = deviceConfig.name;
+                if (!address) {
+                    log.error('Missing device address in configuration.');
+                    return null;
+                }   
+                if (!name) {
+                    log.error('Missing device name in configuration.');
+                    return null;
+                }   
 
-}
+                const uuid = homebridge.hap.uuid.generate(address);
 
-class ZenggeLedStripAccessory {
-    constructor(log, config) {
-        this.log = log;
-        this.name = config.name || 'Zengge LED Strip';
-        this.deviceAddress = config.deviceAddress;
-        this.serviceUUID = 'ffff';  // Service UUID for the device
-        this.writeUUID = 'ff01';    // Write characteristic UUID for sending commands to the device
-        this.notifyUUID = 'ff02';   // Notify characteristic UUID for receiving updates
-        this.isOn = false;
-        this.brightness = 100;
-        this.peripheral = null;
+                return {
+                    uuid: uuid,
+                    homebridgeAccessory: () => {
+                        const cachedAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
+                        if (cachedAccessory) {
+                            return cachedAccessory;
+                        } 
+                        
+                        return new homebridge.platformAccessory(name, uuid);
+                    },
+                    controller: new ZenggeLedStripPlatformAccessory(this.log, deviceConfig),
+                }
+                
+            }).filter(accessory => accessory !== null);
 
-        // Create Lightbulb services
-        this.onService = new hap.Service.Lightbulb(this.name, 'on-switch');
-        this.redService = new hap.Service.Lightbulb(this.name, 'red-switch');
+                log.info('Initialization complete.');
+                log.info('Registering accessories:', accessories.map(accessory => accessory.displayName).join(', '));
+                homebridge.registerPlatformAccessories(PLATFORM_NAME, PLATFORM_NAME, accessories.map(accessory => accessory.homebridgeAccessory));
+                accessories.forEach(accessory => {
+                accessory.controller.launchWithAccessory(accessory.homebridgeAccessory);
+             
+                this.initialize()
+            }).catch(error => {
+                log.error('Error during initialization:', error);
+            });
+        });
+      }
 
-        this.onService.getCharacteristic(hap.Characteristic.On)
-            .on(CharacteristicEventTypes.SET, this.setOn.bind(this))
-            .on(CharacteristicEventTypes.GET, this.getOn.bind(this));
-
-        this.redService.getCharacteristic(hap.Characteristic.On)
-            .on(CharacteristicEventTypes.SET, this.setOn.bind(this))
-            .on(CharacteristicEventTypes.GET, this.getOn.bind(this));
-
-        this.initialize();
-    }
-
-    async onConnected() {
-        await this.setPower(true);  // Allumer les LEDs
-        await this.setPattern(1);  // Changer la couleur en rouge
-        await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
-        await this.setPattern(2);  // Changer la couleur en rouge 
-               await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
-        await this.setPattern(3);  // Changer la couleur en rouge
+     // Called when a cached accessory is loaded
+    configureAccessory(accessory) {
+        this.accessories.push(accessory);
     }
 
     async initialize() {
@@ -96,10 +115,11 @@ class ZenggeLedStripAccessory {
         });
 
         noble.on('discover', async (peripheral) => {
-            if (peripheral.address === this.deviceAddress.toLowerCase()) {
-                this.log(`Found device: ${peripheral.address}`);
-                noble.stopScanning();
-                await this.connectToDevice(peripheral);
+            const accessory = this.accessories.find(accessory => accessory.controller.deviceAddress.toLowerCase() === peripheral.address.toLowerCase());
+            if(accessory) {
+                this.log(`Found registered device: ${peripheral.address}`);
+                await accessory.controller.connectToDevice(peripheral);
+                //noble.stopScanning(); //quand tout est trouvé
             }
         });
 
@@ -107,6 +127,57 @@ class ZenggeLedStripAccessory {
             this.log('Device disconnected, attempting to reconnect...');
             noble.startScanning([], false);  // Restart scanning on disconnect
         });
+    }
+
+}
+
+class ZenggeLedStripPlatformAccessory  {
+    accessory;
+  config;
+  name;
+  log;
+  service;
+
+    constructor(log, config) {
+        this.log = log;
+        this.name = config.name || 'Zengge LED Strip';
+        this.deviceAddress = config.address;
+        this.serviceUUID = 'ffff';  // Service UUID for the device
+        this.writeUUID = 'ff01';    // Write characteristic UUID for sending commands to the device
+        this.notifyUUID = 'ff02';   // Notify characteristic UUID for receiving updates
+        this.isOn = false;
+        this.brightness = 100;
+        this.peripheral = null;
+    }
+
+    launchWithAccessory(accessory) {
+
+   // Create Lightbulb services
+   this.onService = new hap.Service.Lightbulb(this.name, 'on-switch');
+   this.redService = new hap.Service.Lightbulb(this.name, 'red-switch');
+
+   this.onService.getCharacteristic(hap.Characteristic.On)
+       .on(CharacteristicEventTypes.SET, this.setOn.bind(this))
+       .on(CharacteristicEventTypes.GET, this.getOn.bind(this));
+
+   this.redService.getCharacteristic(hap.Characteristic.On)
+       .on(CharacteristicEventTypes.SET, this.setOn.bind(this))
+       .on(CharacteristicEventTypes.GET, this.getOn.bind(this));
+
+        accessory.getService(hap.Service.AccessoryInformation)
+        .setCharacteristic(Characteristic.Manufacturer, 'Zengge')
+        .setCharacteristic(Characteristic.Model, PLATFORM_NAME)
+        .setCharacteristic(Characteristic.Identity, deviceAddress);
+     
+    }
+
+    async onConnected() {
+        await this.setPower(true);  // Allumer les LEDs
+        await this.setPattern(1);  // Changer la couleur en rouge
+        await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
+        await this.setPattern(2);  // Changer la couleur en rouge 
+               await new Promise(resolve => setTimeout(resolve, 2000));  // Sleep for 2 seconds
+        await this.setPattern(3);  // Changer la couleur en rouge
     }
 
     async connectToDevice(peripheral) {
