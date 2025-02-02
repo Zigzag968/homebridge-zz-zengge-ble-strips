@@ -13,6 +13,7 @@ import {
 import { exec } from 'child_process';
 
 const PLATFORM_NAME = 'HomebridgeZzZenggeBleStrips';
+const PACKAGE_NAME = 'homebridge-zz-zengge-ble-strips';
 
 let hap: HAP;
 
@@ -120,18 +121,30 @@ class BluetoothCommunicator {
       }
     });
 
-    setInterval(() => {
-      const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
-      const missingDevices = expectedDevices.filter((addr: string) => {
-        const peripheral = this.peripherals.get(addr);
-        return !peripheral || peripheral.state !== 'connected';
-      });
 
-      if (missingDevices.length > 0) {
-        this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
-        this.startBluetoothScanning();
-      }
-    }, 5000);
+  let attemptCount = 0;
+  let interval = 5000;
+
+  setInterval(() => {
+    const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
+    const missingDevices = expectedDevices.filter((addr: string) => {
+    const peripheral = this.peripherals.get(addr);
+    return !peripheral || peripheral.state !== 'connected';
+    });
+
+    if (missingDevices.length > 0) {
+    this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
+    this.startBluetoothScanning();
+    attemptCount++;
+    if (attemptCount > 5) {
+      const intervals = [5000, 1800000, 3600000];
+      interval = attemptCount <= 5 ? intervals[0] : attemptCount <= 10 ? intervals[1] : intervals[2];
+    }
+    } else {
+    attemptCount = 0;
+    interval = 5000;
+    }
+  }, interval);
   }
 
   private deviceDiscovered(peripheral: Peripheral) {
@@ -224,7 +237,7 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
         controller.configure(accessory);
 
         this.homebridge.registerPlatformAccessories(
-          'homebridge-zz-zengge-ble-strips',
+          PACKAGE_NAME,
           PLATFORM_NAME,
           [accessory],
         );
@@ -240,6 +253,7 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
     });
 
     this.initializeBluetoothSwitchAccessory();
+    this.initializeRebootSwitchAccessory();
     this.log.info('Initialization complete.');
   }
 
@@ -292,7 +306,7 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
       this.configureBluetoothSwitchAccessory(accessory);
 
       this.homebridge.registerPlatformAccessories(
-        'homebridge-zz-zengge-ble-strips',
+        PACKAGE_NAME,
         PLATFORM_NAME,
         [accessory],
       );
@@ -358,7 +372,66 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
       });
     });
   }
+private initializeRebootSwitchAccessory() {
+  const uuid = this.homebridge.hap.uuid.generate('HostRebootSwitch');
+  let accessory = this.accessories.find((accessory) => accessory.UUID === uuid);
+
+  if (accessory) {
+    this.log.info('Host Reboot Switch accessory already exists.');
+    this.configureRebootSwitchAccessory(accessory);
+  } else {
+    accessory = new this.homebridge.platformAccessory('Host Reboot', uuid);
+    accessory.category = hap.Categories.SWITCH;
+
+    this.configureRebootSwitchAccessory(accessory);
+
+    this.homebridge.registerPlatformAccessories(
+      PACKAGE_NAME,
+      PLATFORM_NAME,
+      [accessory],
+    );
+
+    this.accessories.push(accessory);
+  }
 }
+
+private configureRebootSwitchAccessory(accessory: PlatformAccessory) {
+  const switchService =
+    accessory.getService(hap.Service.Switch) ||
+    accessory.addService(hap.Service.Switch, 'Host Reboot', 'host-reboot-switch');
+
+  switchService
+    .getCharacteristic(hap.Characteristic.On)
+    .onSet(this.setHostReboot.bind(this))
+    .onGet(this.getHostReboot.bind(this));
+
+  accessory
+    .getService(hap.Service.AccessoryInformation)!
+    .setCharacteristic(hap.Characteristic.Manufacturer, 'YourCompany')
+    .setCharacteristic(hap.Characteristic.Model, 'Host Reboot Switch')
+    .setCharacteristic(hap.Characteristic.SerialNumber, 'HB-002');
+
+  accessory.context.isHostRebootSwitch = true;
+}
+
+private async setHostReboot(value: CharacteristicValue) {
+  if (value as boolean) {
+    this.log.info('Rebooting host...');
+    exec('sudo reboot', (error, stdout, stderr) => {
+      if (error) {
+        this.log.error(`Error rebooting host: ${error.message}`);
+        return;
+      }
+      this.log.info('Host reboot command executed.');
+    });
+  }
+}
+
+private async getHostReboot(): Promise<CharacteristicValue> {
+  return false; // Always return false as the switch should be momentary
+}
+}
+
 class ZenggeLedStripPlatformAccessory {
   private readonly logger: Logger;
   private readonly name: string;
@@ -492,42 +565,144 @@ class ZenggeLedStripPlatformAccessory {
     return this.isOn;
   }
 
-  async setTrame(trameName: string, value: CharacteristicValue): Promise<void> {
-    this.log(`Entering setTrame with trameName='${trameName}', value=${value}`);
-    try {
-      const boolValue = value as boolean;
-      this.log(`boolValue: ${boolValue}`);
-      if (boolValue) {
-        this.trameStates[trameName] = true;
-        this.log(`Trame '${trameName}' switch turned ON`);
-        this.log(`trameStates after turning on '${trameName}':`, this.trameStates);
-        const trame = this.trames.find((t) => t.name === trameName);
-        if (trame) {
-          const commandBuffer = Buffer.from(trame.trame, 'hex');
-          await this.sendCommand(commandBuffer);
-          this.log(`Sent trame command for '${trameName}'`);
-        } else {
-          const errorMsg = `Trame '${trameName}' not found in configuration`;
-          this.log(errorMsg);
-          throw new Error(errorMsg);
-        }
-        await this.turnOffOtherTrames(trameName);
-        this.log(`Finished turning off other trames`);
-        if (!this.isOn) {
-          this.log('Power is off, turning it on');
-          await this.setPower(true);
-        }
-      } else {
-        await this.setPower(false);
-        this.trameStates[trameName] = false;
-        this.log(`Trame '${trameName}' switch turned OFF`);
-      }
-    } catch (error) {
-      this.logger.error('Error in setTrame:', error);
-      throw error;
-    } finally {
-      this.log(`Exiting setTrame for trameName='${trameName}'`);
+  async setCustomGradient(
+    mode: number,
+    stops: Array<{ color: string; pos: number }>
+  ): Promise<void> {
+    // On s'assure que les stops sont triés par position croissante
+    stops.sort((a, b) => a.pos - b.pos);
+  
+    // Choix du header et footer en fonction du mode (les 2 premiers octets et les 6 derniers octets varient)
+    let header: string;
+    let footer: string;
+    switch (mode) {
+      case 1: // dégradé entre 2 oranges claires
+        header = "002880000063640B590063";
+        footer = "001E016400BF";
+        break;
+      case 2: // dégradé entre 2 bleu
+        header = "000880000063640B590063";
+        footer = "001E02360043";
+        break;
+      case 3: // dégradé entre 2 rose
+        header = "001C80000063640B590063";
+        footer = "001E02640064";
+        break;
+      default:
+        this.logger.error("Invalid mode:", mode);
+        return;
     }
+    
+    // Le gradient table doit comporter 30 "words" (chaque word = 3 octets = 6 hex)
+    const numWords = 30;
+    let gradientTable = "";
+    
+    // Pour chaque segment (i de 0 à 29), on calcule t entre 0 et 1
+    for (let i = 0; i < numWords; i++) {
+      const t = i / (numWords - 1);
+      // Trouver les deux stops entre lesquels t se trouve
+      let lower = stops[0],
+          upper = stops[stops.length - 1];
+      for (let j = 0; j < stops.length - 1; j++) {
+        if (t >= stops[j].pos && t <= stops[j + 1].pos) {
+          lower = stops[j];
+          upper = stops[j + 1];
+          break;
+        }
+      }
+      // Normaliser t entre lower.pos et upper.pos (attention à la division par zéro)
+      const localT =
+        lower.pos === upper.pos
+          ? 0
+          : (t - lower.pos) / (upper.pos - lower.pos);
+      
+      // On retire le caractère '#' s'il existe et on extrait les composantes RGB
+      const formatColor = (col: string) =>
+        col.startsWith("#") ? col.slice(1) : col;
+      const lc = formatColor(lower.color);
+      const uc = formatColor(upper.color);
+      const rLower = parseInt(lc.slice(0, 2), 16);
+      const gLower = parseInt(lc.slice(2, 4), 16);
+      const bLower = parseInt(lc.slice(4, 6), 16);
+      const rUpper = parseInt(uc.slice(0, 2), 16);
+      const gUpper = parseInt(uc.slice(2, 4), 16);
+      const bUpper = parseInt(uc.slice(4, 6), 16);
+      
+      // Interpolation linéaire sur chaque canal (sur 8 bits)
+      const r = Math.round(rLower + (rUpper - rLower) * localT);
+      const g = Math.round(gLower + (gUpper - gLower) * localT);
+      const b = Math.round(bLower + (bUpper - bLower) * localT);
+      
+      // Le contrôleur attend l'ordre GRB (chaque composante sur 8 bits)
+      const word =
+        g.toString(16).toUpperCase().padStart(2, "0") +
+        r.toString(16).toUpperCase().padStart(2, "0") +
+        b.toString(16).toUpperCase().padStart(2, "0");
+      gradientTable += word;
+    }
+    
+    // La trame finale est la concaténation du header, de la table de gradient et du footer.
+    // La longueur attendue est de 214 caractères hexadécimaux (11 octets header + 30*3 octets gradient + 6 octets footer = 107 octets)
+    const commandHex = header + gradientTable + footer;
+    if (commandHex.length !== 214) {
+      this.logger.error(
+        `La trame générée contient ${commandHex.length} caractères (attendu: 214).`
+      );
+      return;
+    }
+    
+    const command = Buffer.from(commandHex, "hex");
+    this.log("Setting gradient with command:", commandHex, `(${commandHex.length} characters)`);
+    await this.sendCommand(command);
+  }
+
+  async setTrame(trameName: string, value: CharacteristicValue): Promise<void> {
+    const colors = ['FF0000', '00FF00', '0000FF', 'FFFF00', 'FF00FF', '00FFFF'];
+    const shuffledColors = colors.sort(() => 0.5 - Math.random());
+
+    const startColor = shuffledColors[0];
+    const endColor = shuffledColors[1];
+
+    // this.log(`Entering setTrame with trameName='${trameName}', value=${value}`);
+    const stops = [
+      { color: startColor, pos: 0 },
+      { color: endColor, pos: 1 },
+    ];
+    return this.setCustomGradient(1, stops);
+    // try {
+    //   const boolValue = value as boolean;
+    //   this.log(`boolValue: ${boolValue}`);
+    //   if (boolValue) {
+    //     this.trameStates[trameName] = true;
+    //     this.log(`Trame '${trameName}' switch turned ON`);
+    //     this.log(`trameStates after turning on '${trameName}':`, this.trameStates);
+    //     const trame = this.trames.find((t) => t.name === trameName);
+    //     if (trame) {
+    //       const commandBuffer = Buffer.from(trame.trame, 'hex');
+    //       await this.sendCommand(commandBuffer);
+    //       this.log(`Sent trame command for '${trameName}'`);
+    //     } else {
+    //       const errorMsg = `Trame '${trameName}' not found in configuration`;
+    //       this.log(errorMsg);
+    //       throw new Error(errorMsg);
+    //     }
+    //     await this.turnOffOtherTrames(trameName);
+    //     this.log(`Finished turning off other trames`);
+    //     if (!this.isOn) {
+    //       this.log('Power is off, turning it on');
+    //       await this.setPower(true);
+    //     }
+    //   } else {
+    //     await this.setPower(false);
+    //     this.trameStates[trameName] = false;
+    //     this.log(`Trame '${trameName}' switch turned OFF`);
+    //   }
+    // } catch (error) {
+    //   this.logger.error('Error in setTrame:', error);
+    //   throw error;
+    // } finally {
+    //   this.log(`Exiting setTrame for trameName='${trameName}'`);
+    // }
   }
 
   private async turnOffOtherTrames(trameName: string) {
