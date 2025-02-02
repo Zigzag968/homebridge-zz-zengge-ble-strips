@@ -440,35 +440,56 @@ class ZenggeLedStripPlatformAccessory {
   private accessory: PlatformAccessory;
   private isOn: boolean = false;
   private onService!: Service;
-  private trames: { name: string; trame: string }[] = [];
-  private trameStates: { [key: string]: boolean } = {};
-  private trameServices: { [key: string]: Service } = {};
+  // Suppression de la gestion des trames statiques
+  // private trames: { name: string; trame: string }[] = [];
+  // private trameStates: { [key: string]: boolean } = {};
+  // private trameServices: { [key: string]: Service } = {};
+
+  // Nouvel attribut pour gérer les color stops
+  private colorStops: Array<{
+    service: Service;
+    isOn: boolean;
+    hue: number;         // valeur en degrés (0-360)
+    saturation: number;  // en pourcentage (0-100)
+    color: string;       // couleur au format hexadécimal "RRGGBB"
+  }> = [];
+  private NUM_STOPS: number = 5;
+
   private counter: number = 0;
 
-  constructor(bluetoothCommunicator: BluetoothCommunicator, logger: Logger, config: DeviceConfig, accessory: PlatformAccessory) {
+  constructor(
+    bluetoothCommunicator: BluetoothCommunicator,
+    logger: Logger,
+    config: DeviceConfig,
+    accessory: PlatformAccessory
+  ) {
     this.bluetoothCommunicator = bluetoothCommunicator;
     this.logger = logger;
     this.name = config.name || 'Zengge LED Strip';
-    this.trames = config.trames || [];
+    // On ignore la configuration des trames dans ce refactoring
     this.deviceAddress = config.address;
     this.accessory = accessory;
-    this.log('Trames:', this.trames);
+    this.log('Accessory initialized:', this.name);
   }
 
   log(...messages: any[]) {
-    const message = messages.map((msg) => (typeof msg === 'object' ? JSON.stringify(msg) : msg)).join(' ');
+    const message = messages
+      .map((msg) => (typeof msg === 'object' ? JSON.stringify(msg) : msg))
+      .join(' ');
     this.logger.info(`[${this.name}] ${message}`);
   }
 
   error(...messages: any[]) {
-    const message = messages.map((msg) => (typeof msg === 'object' ? JSON.stringify(msg) : msg)).join(' ');
+    const message = messages
+      .map((msg) => (typeof msg === 'object' ? JSON.stringify(msg) : msg))
+      .join(' ');
     this.logger.error(`[${this.name}] ${message}`);
   }
 
   configure(accessory: PlatformAccessory) {
     accessory.category = hap.Categories.LIGHTBULB;
     this.createPowerSwitchService(accessory);
-    this.createTrameSwitchServices(accessory);
+    this.createColorStopServices(accessory);
 
     const accessoryInfoService = accessory.getService(hap.Service.AccessoryInformation);
     if (accessoryInfoService) {
@@ -482,33 +503,138 @@ class ZenggeLedStripPlatformAccessory {
     }
   }
 
+  private primaryHue: number = 0;
+  private primarySaturation: number = 100;
+  
   private createPowerSwitchService(accessory: PlatformAccessory) {
     this.isOn = accessory.context.isOn || false;
-    this.onService = accessory.getServiceById(hap.Service.Lightbulb, 'power-service') || accessory.addService(hap.Service.Lightbulb, 'Power', 'power-service');
+    this.onService =
+      accessory.getServiceById(hap.Service.Lightbulb, 'power-service') ||
+      accessory.addService(hap.Service.Lightbulb, 'Power', 'power-service');
     this.onService.setCharacteristic(hap.Characteristic.Name, 'Power');
-    this.onService.getCharacteristic(hap.Characteristic.On).onSet(this.setOn.bind(this)).onGet(this.getOn.bind(this));
+  
+    // Ajout de la caractéristique On
+    this.onService
+      .getCharacteristic(hap.Characteristic.On)
+      .onSet(this.setOn.bind(this))
+      .onGet(this.getOn.bind(this));
+  
+    // Ajout de Hue et Saturation pour que Siri reconnaisse le support de la couleur
+    if (!this.onService.testCharacteristic(hap.Characteristic.Hue)) {
+      this.onService.addCharacteristic(hap.Characteristic.Hue);
+    }
+    if (!this.onService.testCharacteristic(hap.Characteristic.Saturation)) {
+      this.onService.addCharacteristic(hap.Characteristic.Saturation);
+    }
+    this.onService
+      .getCharacteristic(hap.Characteristic.Hue)
+      .onSet(this.setPrimaryHue.bind(this))
+      .onGet(this.getPrimaryHue.bind(this));
+    this.onService
+      .getCharacteristic(hap.Characteristic.Saturation)
+      .onSet(this.setPrimarySaturation.bind(this))
+      .onGet(this.getPrimarySaturation.bind(this));
+  
     this.onService.setPrimaryService(true);
     this.onService.updateCharacteristic(hap.Characteristic.On, this.isOn);
-    this.log(`Set Power service as primary for accessory: ${this.name}`);
+    this.log(`Service Power (primary) créé pour ${this.name}`);
   }
 
-  private createTrameSwitchServices(accessory: PlatformAccessory) {
-    this.log('Creating trame switch services...', this.trames.map((trame: any) => trame.name).join(', '));
-    this.trames.forEach((trame) => {
-      const trameName = trame.name;
-      const serviceName = trameName;
-      const serviceSubType = `trame-${Buffer.from(trameName).toString('hex')}`;
-      const trameService = accessory.getServiceById(hap.Service.Switch, serviceSubType) || accessory.addService(hap.Service.Switch, serviceName, serviceSubType);
-      trameService.setCharacteristic(hap.Characteristic.Name, trameName);
-      trameService.getCharacteristic(hap.Characteristic.On).onSet(this.setTrame.bind(this, trameName)).onGet(this.getTrame.bind(this, trameName));
-      this.trameStates[trameName] = false;
-      this.trameServices[trameName] = trameService;
+  async setPrimaryHue(value: CharacteristicValue): Promise<void> {
+    this.primaryHue = value as number;
+    this.onService.updateCharacteristic(hap.Characteristic.Hue, value);
+    this.log(`Hue principale mise à jour: ${value}`);
+  
+    // Exemple : propager la valeur aux stops activés
+    this.colorStops.forEach((stop, index) => {
+      if (stop.isOn) {
+        stop.hue = this.primaryHue;
+        // On recalcul la couleur en fonction de la nouvelle teinte (avec saturation du stop et luminosité fixe, ici 50%)
+        stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
+        stop.service.updateCharacteristic(hap.Characteristic.Hue, this.primaryHue);
+      }
     });
+    await this.updateGradientFromColorStops();
+  }
+  
+  async getPrimaryHue(): Promise<CharacteristicValue> {
+    return this.primaryHue;
+  }
+  
+  async setPrimarySaturation(value: CharacteristicValue): Promise<void> {
+    const newSat = (value as number) < 50 ? 50 : (value as number);
+    this.primarySaturation = newSat;
+    this.onService.updateCharacteristic(hap.Characteristic.Saturation, value);
+    this.log(`Saturation principale mise à jour: ${value}`);
+  
+    // Exemple : propager la valeur aux stops activés
+    this.colorStops.forEach((stop, index) => {
+      if (stop.isOn) {
+        stop.saturation = this.primarySaturation;
+        stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
+        stop.service.updateCharacteristic(hap.Characteristic.Saturation, this.primarySaturation);
+      }
+    });
+    await this.updateGradientFromColorStops();
+  }
+  
+  async getPrimarySaturation(): Promise<CharacteristicValue> {
+    return this.primarySaturation;
+  }
+
+  /**
+   * Création de 5 services Lightbulb représentant chacun un color stop.
+   * Chaque service dispose des caractéristiques On, Hue et Saturation.
+   */
+  private createColorStopServices(accessory: PlatformAccessory) {
+    this.log('Creating color stop services...');
+    for (let i = 0; i < this.NUM_STOPS; i++) {
+      const serviceName = `Color Stop ${i + 1}`;
+      const serviceId = `color-stop-${i + 1}`;
+      const colorService =
+        accessory.getServiceById(hap.Service.Lightbulb, serviceId) ||
+        accessory.addService(hap.Service.Lightbulb, serviceName, serviceId);
+      colorService.setCharacteristic(hap.Characteristic.Name, serviceName);
+      
+      // Gestion de la caractéristique On pour activer/désactiver le stop
+      colorService
+        .getCharacteristic(hap.Characteristic.On)
+        .onSet((value) => this.setColorStopOn(i, value))
+        .onGet(() => this.getColorStopOn(i));
+      
+      // Ajout de la caractéristique Hue (si elle n'existe pas déjà)
+      if (!colorService.testCharacteristic(hap.Characteristic.Hue)) {
+        colorService.addCharacteristic(hap.Characteristic.Hue);
+      }
+      colorService
+        .getCharacteristic(hap.Characteristic.Hue)
+        .onSet((value) => this.setColorStopHue(i, value))
+        .onGet(() => this.getColorStopHue(i));
+      
+      // Ajout de la caractéristique Saturation
+      if (!colorService.testCharacteristic(hap.Characteristic.Saturation)) {
+        colorService.addCharacteristic(hap.Characteristic.Saturation);
+      }
+      colorService
+        .getCharacteristic(hap.Characteristic.Saturation)
+        .onSet((value) => this.setColorStopSaturation(i, value))
+        .onGet(() => this.getColorStopSaturation(i));
+      
+      // Initialisation par défaut : stop désactivé et couleur rouge (Hue = 0, Saturation = 100)
+      this.colorStops.push({
+        service: colorService,
+        isOn: false,
+        hue: 0,
+        saturation: 100,
+        color: 'FF0000',
+      });
+    }
   }
 
   preparePacket(packet: Buffer): Buffer {
     const count = this.getCounter();
-    packet[0] = 0xff00 & count;
+    // Affectation des 2 premiers octets avec le compteur
+    packet[0] = (0xff00 & count) >> 8;
     packet[1] = 0x00ff & count;
     return packet;
   }
@@ -519,30 +645,6 @@ class ZenggeLedStripPlatformAccessory {
 
   async sendCommand(command: Buffer) {
     return this.bluetoothCommunicator.sendCommand(this.deviceAddress, this.preparePacket(command));
-  }
-
-  async setPattern(index: number) {
-    let command: Buffer | null = null;
-    switch (index) {
-      case 1:
-        command = Buffer.from('000f80000063640b590063e543ffe049f8db4ff1d656ead15ce3cc63dcc769d6c270cfbd76c8b87dc1b383baae8ab3a990ada497a69f9d9f9aa49895aa918fb18a8bb78486be7d81c4767ccb6f77d16872d8616cde5b68e55463eb4d5df24659f83f54ff39001e0164009d', 'hex');
-        break;
-      case 2:
-        command = Buffer.from('000980000063640b5900630059ff0055ff0052ff004fff004cff0049ff0046ff0043ff0040ff003dff003aff0037ff0034ff0031ff002eff002aff0027ff0024ff0021ff001eff001bff0018ff0015ff0012ff000fff000cff0009ff0006ff0003ff0000ff001e0227000e', 'hex');
-        break;
-      case 3:
-        command = Buffer.from('000680000063640b590063ff0000f60008ed0011e4001adb0023d3002bca0034c1003db80046af004fa700579e00619500698c007283007b7b008372008c69009560009e5700a74f00af4600b83d00c13400ca2b00d32300db1a00e41100ed0800f60000ff001e01640005', 'hex');
-        break;
-      default:
-        this.logger.error('Invalid pattern index:', index);
-        return;
-    }
-    if (!command) {
-      this.logger.error('Command not found for pattern index:', index);
-      return;
-    }
-    this.log('Setting pattern:', index); 
-    await this.sendCommand(command);
   }
 
   async setPower(value: boolean) {
@@ -559,48 +661,181 @@ class ZenggeLedStripPlatformAccessory {
   async setOn(value: CharacteristicValue): Promise<void> {
     this.log('setOn called with value:', value);
     await this.setPower(value as boolean);
+    // Lors de la mise sous tension, on met à jour le dégradé (si au moins 2 stops sont activés)
+    if (value) {
+      await this.updateGradientFromColorStops();
+    }
   }
 
   async getOn(): Promise<CharacteristicValue> {
     return this.isOn;
   }
 
+  // ----- Gestion des color stops -----
+
+  async setColorStopOn(index: number, value: CharacteristicValue): Promise<void> {
+    this.log(`setColorStopOn for stop ${index + 1} called with value:`, value);
+    this.colorStops[index].isOn = value as boolean;
+    this.colorStops[index].service.updateCharacteristic(hap.Characteristic.On, value);
+    // Mise à jour du dégradé dès que l’état d’un stop change
+    await this.updateGradientFromColorStops();
+  }
+
+  async getColorStopOn(index: number): Promise<CharacteristicValue> {
+    return this.colorStops[index].isOn;
+  }
+
+  async setColorStopHue(index: number, value: CharacteristicValue): Promise<void> {
+    this.log(`setColorStopHue for stop ${index + 1} called with value:`, value);
+    this.colorStops[index].hue = value as number;
+    // Mise à jour de la couleur (en partant d'une luminosité par défaut de 50%)
+    this.colorStops[index].color = this.hslToHex(this.colorStops[index].hue, this.colorStops[index].saturation, 50);
+    this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Hue, value);
+    await this.updateGradientFromColorStops();
+  }
+
+  async getColorStopHue(index: number): Promise<CharacteristicValue> {
+    return this.colorStops[index].hue;
+  }
+
+  async setColorStopSaturation(index: number, value: CharacteristicValue): Promise<void> {
+    this.log(`setColorStopSaturation for stop ${index + 1} called with value:`, value);
+    this.colorStops[index].saturation = value as number;
+    this.colorStops[index].color = this.hslToHex(this.colorStops[index].hue, this.colorStops[index].saturation, 50);
+    this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Saturation, value);
+    await this.updateGradientFromColorStops();
+  }
+
+  async getColorStopSaturation(index: number): Promise<CharacteristicValue> {
+    return this.colorStops[index].saturation;
+  }
+
+  /**
+   * Fonction utilitaire pour convertir des valeurs HSL en une couleur hexadécimale.
+   * @param h Hue (0-360)
+   * @param s Saturation (0-100)
+   * @param l Luminosité (0-100) – ici on utilisera 50% par défaut pour un rendu vif
+   */
+  hslToHex(h: number, s: number, l: number): string {
+    s /= 100;
+    l /= 100;
+  
+    const c = (1 - Math.abs(2 * l - 1)) * s;
+    const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+    const m = l - c / 2;
+    let r = 0,
+      g = 0,
+      b = 0;
+  
+    if (h < 60) {
+      r = c;
+      g = x;
+      b = 0;
+    } else if (h < 120) {
+      r = x;
+      g = c;
+      b = 0;
+    } else if (h < 180) {
+      r = 0;
+      g = c;
+      b = x;
+    } else if (h < 240) {
+      r = 0;
+      g = x;
+      b = c;
+    } else if (h < 300) {
+      r = x;
+      g = 0;
+      b = c;
+    } else {
+      r = c;
+      g = 0;
+      b = x;
+    }
+  
+    const toHex = (n: number) => {
+      const hex = Math.round((n + m) * 255)
+        .toString(16)
+        .toUpperCase();
+      return hex.padStart(2, "0");
+    };
+  
+    return toHex(r) + toHex(g) + toHex(b);
+  }
+
+  /**
+   * Calcule le dégradé à envoyer en se basant sur les color stops activés.
+   * Si aucun stop n'est activé, la fonction ne fait rien.
+   * Si un seul stop est activé, il est dupliqué pour obtenir 2 stops.
+   * Sinon, les positions (pos) sont réparties uniformément.
+   */
+  async updateGradientFromColorStops(): Promise<void> {
+    // Sélection des stops activés
+    const activeStops = this.colorStops.filter((stop) => stop.isOn);
+    if (activeStops.length === 0) {
+      this.log('Aucun color stop activé, pas de mise à jour du dégradé.');
+      return;
+    }
+  
+    let stopsToUse: Array<{ color: string; pos: number }> = [];
+    if (activeStops.length === 1) {
+      // Dupliquer le stop unique pour obtenir 2 stops identiques
+      stopsToUse = [
+        { color: activeStops[0].color, pos: 0 },
+        { color: activeStops[0].color, pos: 1 },
+      ];
+    } else {
+      // Répartition uniforme : pos = index / (nombre - 1)
+      const count = activeStops.length;
+      activeStops.forEach((stop, index) => {
+        const pos = count === 1 ? 0 : index / (count - 1);
+        stopsToUse.push({ color: stop.color, pos });
+      });
+    }
+  
+    // Utilisation du mode 1 (modifiable selon vos besoins)
+    await this.setCustomGradient(1, stopsToUse);
+  }
+
+  /**
+   * Génère la trame pour le dégradé et l'envoie au contrôleur.
+   * La logique reste identique à votre implémentation existante.
+   *
+   * @param mode Le mode de trame (détermine header/footer)
+   * @param stops La liste des stops triés (chaque stop a une couleur et une position)
+   */
   async setCustomGradient(
     mode: number,
     stops: Array<{ color: string; pos: number }>
   ): Promise<void> {
-    // On s'assure que les stops sont triés par position croissante
+    // S'assurer que les stops sont triés par position croissante
     stops.sort((a, b) => a.pos - b.pos);
   
-    // Choix du header et footer en fonction du mode (les 2 premiers octets et les 6 derniers octets varient)
     let header: string;
     let footer: string;
     switch (mode) {
-      case 1: // dégradé entre 2 oranges claires
+      case 1:
         header = "002880000063640B590063";
         footer = "001E016400BF";
         break;
-      case 2: // dégradé entre 2 bleu
+      case 2:
         header = "000880000063640B590063";
         footer = "001E02360043";
         break;
-      case 3: // dégradé entre 2 rose
+      case 3:
         header = "001C80000063640B590063";
         footer = "001E02640064";
         break;
       default:
-        this.logger.error("Invalid mode:", mode);
+        this.logger.error("Mode invalide:", mode);
         return;
     }
     
-    // Le gradient table doit comporter 30 "words" (chaque word = 3 octets = 6 hex)
     const numWords = 30;
     let gradientTable = "";
     
-    // Pour chaque segment (i de 0 à 29), on calcule t entre 0 et 1
     for (let i = 0; i < numWords; i++) {
       const t = i / (numWords - 1);
-      // Trouver les deux stops entre lesquels t se trouve
       let lower = stops[0],
           upper = stops[stops.length - 1];
       for (let j = 0; j < stops.length - 1; j++) {
@@ -610,15 +845,9 @@ class ZenggeLedStripPlatformAccessory {
           break;
         }
       }
-      // Normaliser t entre lower.pos et upper.pos (attention à la division par zéro)
-      const localT =
-        lower.pos === upper.pos
-          ? 0
-          : (t - lower.pos) / (upper.pos - lower.pos);
+      const localT = lower.pos === upper.pos ? 0 : (t - lower.pos) / (upper.pos - lower.pos);
       
-      // On retire le caractère '#' s'il existe et on extrait les composantes RGB
-      const formatColor = (col: string) =>
-        col.startsWith("#") ? col.slice(1) : col;
+      const formatColor = (col: string) => (col.startsWith("#") ? col.slice(1) : col);
       const lc = formatColor(lower.color);
       const uc = formatColor(upper.color);
       const rLower = parseInt(lc.slice(0, 2), 16);
@@ -628,21 +857,18 @@ class ZenggeLedStripPlatformAccessory {
       const gUpper = parseInt(uc.slice(2, 4), 16);
       const bUpper = parseInt(uc.slice(4, 6), 16);
       
-      // Interpolation linéaire sur chaque canal (sur 8 bits)
       const r = Math.round(rLower + (rUpper - rLower) * localT);
       const g = Math.round(gLower + (gUpper - gLower) * localT);
       const b = Math.round(bLower + (bUpper - bLower) * localT);
       
-      // Le contrôleur attend l'ordre GRB (chaque composante sur 8 bits)
+      // Ordre GRB attendu par le contrôleur
       const word =
-        g.toString(16).toUpperCase().padStart(2, "0") +
         r.toString(16).toUpperCase().padStart(2, "0") +
+        g.toString(16).toUpperCase().padStart(2, "0") +
         b.toString(16).toUpperCase().padStart(2, "0");
       gradientTable += word;
     }
     
-    // La trame finale est la concaténation du header, de la table de gradient et du footer.
-    // La longueur attendue est de 214 caractères hexadécimaux (11 octets header + 30*3 octets gradient + 6 octets footer = 107 octets)
     const commandHex = header + gradientTable + footer;
     if (commandHex.length !== 214) {
       this.logger.error(
@@ -652,79 +878,7 @@ class ZenggeLedStripPlatformAccessory {
     }
     
     const command = Buffer.from(commandHex, "hex");
-    this.log("Setting gradient with command:", commandHex, `(${commandHex.length} characters)`);
+    this.log("Setting gradient with command:", commandHex, `(${commandHex.length} caractères)`);
     await this.sendCommand(command);
-  }
-
-  async setTrame(trameName: string, value: CharacteristicValue): Promise<void> {
-    const colors = ['FF0000', '00FF00', '0000FF', 'FFFF00', 'FF00FF', '00FFFF'];
-    const shuffledColors = colors.sort(() => 0.5 - Math.random());
-
-    const startColor = shuffledColors[0];
-    const endColor = shuffledColors[1];
-
-    // this.log(`Entering setTrame with trameName='${trameName}', value=${value}`);
-    const stops = [
-      { color: startColor, pos: 0 },
-      { color: endColor, pos: 1 },
-    ];
-    return this.setCustomGradient(1, stops);
-    // try {
-    //   const boolValue = value as boolean;
-    //   this.log(`boolValue: ${boolValue}`);
-    //   if (boolValue) {
-    //     this.trameStates[trameName] = true;
-    //     this.log(`Trame '${trameName}' switch turned ON`);
-    //     this.log(`trameStates after turning on '${trameName}':`, this.trameStates);
-    //     const trame = this.trames.find((t) => t.name === trameName);
-    //     if (trame) {
-    //       const commandBuffer = Buffer.from(trame.trame, 'hex');
-    //       await this.sendCommand(commandBuffer);
-    //       this.log(`Sent trame command for '${trameName}'`);
-    //     } else {
-    //       const errorMsg = `Trame '${trameName}' not found in configuration`;
-    //       this.log(errorMsg);
-    //       throw new Error(errorMsg);
-    //     }
-    //     await this.turnOffOtherTrames(trameName);
-    //     this.log(`Finished turning off other trames`);
-    //     if (!this.isOn) {
-    //       this.log('Power is off, turning it on');
-    //       await this.setPower(true);
-    //     }
-    //   } else {
-    //     await this.setPower(false);
-    //     this.trameStates[trameName] = false;
-    //     this.log(`Trame '${trameName}' switch turned OFF`);
-    //   }
-    // } catch (error) {
-    //   this.logger.error('Error in setTrame:', error);
-    //   throw error;
-    // } finally {
-    //   this.log(`Exiting setTrame for trameName='${trameName}'`);
-    // }
-  }
-
-  private async turnOffOtherTrames(trameName: string) {
-    this.log(`Entering turnOffOtherTrames, excluding '${trameName}'`);
-    for (const otherTrameName of Object.keys(this.trameStates)) {
-      if (otherTrameName !== trameName) {
-        if (this.trameStates[otherTrameName]) {
-          this.trameStates[otherTrameName] = false;
-          const service = this.trameServices[otherTrameName];
-          try {
-            service.getCharacteristic(hap.Characteristic.On).updateValue(false);
-            this.log(`Trame '${otherTrameName}' switch turned OFF`);
-          } catch (error) {
-            this.error(`Error updating characteristic for trame '${otherTrameName}':`, error);
-          }
-        }
-      }
-    }
-    this.log(`Exiting turnOffOtherTrames`);
-  }
-
-  async getTrame(trameName: string): Promise<CharacteristicValue> {
-    return this.trameStates[trameName] || false;
   }
 }
