@@ -432,6 +432,15 @@ private async getHostReboot(): Promise<CharacteristicValue> {
 }
 }
 
+interface ColorStop {
+  index: number;
+  service: Service;
+  isOn: boolean;
+  hue: number;
+  saturation: number;
+  color: string;
+}
+
 class ZenggeLedStripPlatformAccessory {
   private readonly logger: Logger;
   private readonly name: string;
@@ -445,15 +454,12 @@ class ZenggeLedStripPlatformAccessory {
   // private trameStates: { [key: string]: boolean } = {};
   // private trameServices: { [key: string]: Service } = {};
 
-  // Nouvel attribut pour gérer les color stops
-  private colorStops: Array<{
-    service: Service;
-    isOn: boolean;
-    hue: number;         // valeur en degrés (0-360)
-    saturation: number;  // en pourcentage (0-100)
-    color: string;       // couleur au format hexadécimal "RRGGBB"
-  }> = [];
+  private colorStops: ColorStop[] = [];
   private NUM_STOPS: number = 5;
+  get sortedColorStops(): ColorStop[] {
+    return this.colorStops.sort((a, b) => a.index - b.index);
+  }
+
 
   private counter: number = 0;
 
@@ -528,59 +534,45 @@ class ZenggeLedStripPlatformAccessory {
     }
     this.onService
       .getCharacteristic(hap.Characteristic.Hue)
-      .onSet(this.setPrimaryHue.bind(this))
-      .onGet(this.getPrimaryHue.bind(this));
+      .onSet(this.setPrimaryColor.bind(this));
     this.onService
       .getCharacteristic(hap.Characteristic.Saturation)
-      .onSet(this.setPrimarySaturation.bind(this))
-      .onGet(this.getPrimarySaturation.bind(this));
-  
+      .onSet(this.setPrimaryColor.bind(this));
+    
     this.onService.setPrimaryService(true);
     this.onService.updateCharacteristic(hap.Characteristic.On, this.isOn);
     this.log(`Service Power (primary) créé pour ${this.name}`);
-  }
+    }
 
-  async setPrimaryHue(value: CharacteristicValue): Promise<void> {
-    this.primaryHue = value as number;
-    this.onService.updateCharacteristic(hap.Characteristic.Hue, value);
-    this.log(`Hue principale mise à jour: ${value}`);
-  
+    async setPrimaryColor(): Promise<void> {
+    const hue = this.onService.getCharacteristic(hap.Characteristic.Hue).value as number;
+    const saturation = this.onService.getCharacteristic(hap.Characteristic.Saturation).value as number;
+
+    // Désactiver tous les stops sauf le premier et le dernier
+    this.sortedColorStops.forEach((stop, index) => {
+      stop.isOn = index === 0 || index === this.sortedColorStops.length - 1;
+      stop.service.updateCharacteristic(hap.Characteristic.On, stop.isOn);
+    });
+    
+    this.primaryHue = hue;
+    this.primarySaturation = saturation;
+
+    this.log(`Hue principale mise à jour: ${hue}`);
+    this.log(`Saturation principale mise à jour: ${saturation}`);
+    
     // Exemple : propager la valeur aux stops activés
-    this.colorStops.forEach((stop, index) => {
+    this.sortedColorStops.forEach((stop, index) => {
       if (stop.isOn) {
-        stop.hue = this.primaryHue;
-        // On recalcul la couleur en fonction de la nouvelle teinte (avec saturation du stop et luminosité fixe, ici 50%)
-        stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
-        stop.service.updateCharacteristic(hap.Characteristic.Hue, this.primaryHue);
+      stop.hue = this.primaryHue;
+      stop.saturation = this.primarySaturation;
+      // On recalcul la couleur en fonction de la nouvelle teinte et saturation (avec luminosité fixe, ici 50%)
+      stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
+      stop.service.updateCharacteristic(hap.Characteristic.Hue, this.primaryHue);
+      stop.service.updateCharacteristic(hap.Characteristic.Saturation, this.primarySaturation);
       }
     });
     await this.updateGradientFromColorStops();
-  }
-  
-  async getPrimaryHue(): Promise<CharacteristicValue> {
-    return this.primaryHue;
-  }
-  
-  async setPrimarySaturation(value: CharacteristicValue): Promise<void> {
-    const newSat = (value as number) < 50 ? 50 : (value as number);
-    this.primarySaturation = newSat;
-    this.onService.updateCharacteristic(hap.Characteristic.Saturation, value);
-    this.log(`Saturation principale mise à jour: ${value}`);
-  
-    // Exemple : propager la valeur aux stops activés
-    this.colorStops.forEach((stop, index) => {
-      if (stop.isOn) {
-        stop.saturation = this.primarySaturation;
-        stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
-        stop.service.updateCharacteristic(hap.Characteristic.Saturation, this.primarySaturation);
-      }
-    });
-    await this.updateGradientFromColorStops();
-  }
-  
-  async getPrimarySaturation(): Promise<CharacteristicValue> {
-    return this.primarySaturation;
-  }
+    }
 
   /**
    * Création de 5 services Lightbulb représentant chacun un color stop.
@@ -622,11 +614,12 @@ class ZenggeLedStripPlatformAccessory {
       
       // Initialisation par défaut : stop désactivé et couleur rouge (Hue = 0, Saturation = 100)
       this.colorStops.push({
+        index: i,
         service: colorService,
         isOn: false,
-        hue: 0,
+        hue: 30, // Hue for warm white
         saturation: 100,
-        color: 'FF0000',
+        color: 'FFD700', // Hex color for warm white
       });
     }
   }
@@ -771,20 +764,14 @@ class ZenggeLedStripPlatformAccessory {
    */
   async updateGradientFromColorStops(): Promise<void> {
     // Sélection des stops activés
-    const activeStops = this.colorStops.filter((stop) => stop.isOn);
+    const activeStops = this.sortedColorStops.filter((stop) => stop.isOn);
     if (activeStops.length === 0) {
       this.log('Aucun color stop activé, pas de mise à jour du dégradé.');
       return;
     }
   
     let stopsToUse: Array<{ color: string; pos: number }> = [];
-    if (activeStops.length === 1) {
-      // Dupliquer le stop unique pour obtenir 2 stops identiques
-      stopsToUse = [
-        { color: activeStops[0].color, pos: 0 },
-        { color: activeStops[0].color, pos: 1 },
-      ];
-    } else {
+    if (activeStops.length > 1) {
       // Répartition uniforme : pos = index / (nombre - 1)
       const count = activeStops.length;
       activeStops.forEach((stop, index) => {
