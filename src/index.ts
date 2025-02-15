@@ -601,11 +601,13 @@ class ZenggeLedStripPlatformAccessory {
         stop.isOn = true;
         stop.hue = this.primaryHue;
         stop.saturation = this.primarySaturation;
-        // Utiliser la brightness propre au stop (qui peut être égale à primaryBrightness)
+        stop.brightness = this.primaryBrightness;
+        
+        // Recalculer la couleur en utilisant la brightness mise à jour
         stop.color = this.hsvToHex(stop.hue, stop.saturation, stop.brightness);
         stop.service.updateCharacteristic(hap.Characteristic.Hue, stop.hue);
         stop.service.updateCharacteristic(hap.Characteristic.Saturation, stop.saturation);
-        stop.service.updateCharacteristic(hap.Characteristic.Brightness, this.primaryBrightness);
+        stop.service.updateCharacteristic(hap.Characteristic.Brightness, stop.brightness);
         stop.service.updateCharacteristic(hap.Characteristic.On, true);
       } else {
         stop.isOn = false;
