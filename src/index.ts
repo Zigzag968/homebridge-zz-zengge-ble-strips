@@ -533,11 +533,11 @@ class ZenggeLedStripPlatformAccessory {
       this.onService.addCharacteristic(hap.Characteristic.Saturation);
     }
     this.onService
-      .getCharacteristic(hap.Characteristic.Hue)
-      .onSet(this.setPrimaryColor.bind(this));
-    this.onService
-      .getCharacteristic(hap.Characteristic.Saturation)
-      .onSet(this.setPrimaryColor.bind(this));
+    .getCharacteristic(hap.Characteristic.Hue)
+    .onSet(this.setPrimaryHue.bind(this));
+  this.onService
+    .getCharacteristic(hap.Characteristic.Saturation)
+    .onSet(this.setPrimarySaturation.bind(this));
     
     this.onService.setPrimaryService(true);
     this.onService.updateCharacteristic(hap.Characteristic.On, this.isOn);
@@ -573,6 +573,44 @@ class ZenggeLedStripPlatformAccessory {
     });
     await this.updateGradientFromColorStops();
     }
+
+    // Puis, définissez les fonctions de callback :
+async setPrimaryHue(value: CharacteristicValue): Promise<void> {
+  this.primaryHue = value as number;
+  this.onService.updateCharacteristic(hap.Characteristic.Hue, this.primaryHue);
+  this.log(`Hue principale mise à jour: ${this.primaryHue}`);
+  // Propager la nouvelle teinte aux color stops actifs (par exemple, le premier et le dernier)
+  this.updateActiveColorStops();
+  await this.updateGradientFromColorStops();
+}
+
+async setPrimarySaturation(value: CharacteristicValue): Promise<void> {
+  this.primarySaturation = value as number;
+  this.onService.updateCharacteristic(hap.Characteristic.Saturation, this.primarySaturation);
+  this.log(`Saturation principale mise à jour: ${this.primarySaturation}`);
+  // Propager la nouvelle saturation aux color stops actifs
+  this.updateActiveColorStops();
+  await this.updateGradientFromColorStops();
+}
+
+// Fonction utilitaire pour mettre à jour les stops actifs (ici le premier et le dernier)
+private updateActiveColorStops(): void {
+  this.sortedColorStops.forEach((stop, index) => {
+    if (index === 0 || index === this.sortedColorStops.length - 1) {
+      stop.isOn = true;
+      stop.hue = this.primaryHue;
+      stop.saturation = this.primarySaturation;
+      // Calcul de la couleur avec une luminosité fixe (ici 50%)
+      stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
+      stop.service.updateCharacteristic(hap.Characteristic.Hue, stop.hue);
+      stop.service.updateCharacteristic(hap.Characteristic.Saturation, stop.saturation);
+      stop.service.updateCharacteristic(hap.Characteristic.On, true);
+    } else {
+      stop.isOn = false;
+      stop.service.updateCharacteristic(hap.Characteristic.On, false);
+    }
+  });
+}
 
   /**
    * Création de 5 services Lightbulb représentant chacun un color stop.
@@ -709,17 +747,13 @@ class ZenggeLedStripPlatformAccessory {
    * @param s Saturation (0-100)
    * @param l Luminosité (0-100) – ici on utilisera 50% par défaut pour un rendu vif
    */
-  hslToHex(h: number, s: number, l: number): string {
+  hsvToHex(h: number, s: number, v: number): string {
     s /= 100;
-    l /= 100;
-  
-    const c = (1 - Math.abs(2 * l - 1)) * s;
+    v /= 100;
+    const c = v * s;
     const x = c * (1 - Math.abs((h / 60) % 2 - 1));
-    const m = l - c / 2;
-    let r = 0,
-      g = 0,
-      b = 0;
-  
+    const m = v - c;
+    let r = 0, g = 0, b = 0;
     if (h < 60) {
       r = c;
       g = x;
@@ -745,15 +779,14 @@ class ZenggeLedStripPlatformAccessory {
       g = 0;
       b = x;
     }
-  
-    const toHex = (n: number) => {
-      const hex = Math.round((n + m) * 255)
-        .toString(16)
-        .toUpperCase();
-      return hex.padStart(2, "0");
-    };
-  
-    return toHex(r) + toHex(g) + toHex(b);
+    const R = Math.round((r + m) * 255);
+    const G = Math.round((g + m) * 255);
+    const B = Math.round((b + m) * 255);
+    return (
+      R.toString(16).toUpperCase().padStart(2, "0") +
+      G.toString(16).toUpperCase().padStart(2, "0") +
+      B.toString(16).toUpperCase().padStart(2, "0")
+    );
   }
 
   /**
