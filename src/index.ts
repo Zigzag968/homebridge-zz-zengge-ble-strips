@@ -438,6 +438,7 @@ interface ColorStop {
   isOn: boolean;
   hue: number;
   saturation: number;
+  brightness: number;
   color: string;
 }
 
@@ -511,7 +512,8 @@ class ZenggeLedStripPlatformAccessory {
 
   private primaryHue: number = 0;
   private primarySaturation: number = 100;
-  
+  private primaryBrightness: number = 100; 
+
   private createPowerSwitchService(accessory: PlatformAccessory) {
     this.isOn = accessory.context.isOn || false;
     this.onService =
@@ -532,12 +534,35 @@ class ZenggeLedStripPlatformAccessory {
     if (!this.onService.testCharacteristic(hap.Characteristic.Saturation)) {
       this.onService.addCharacteristic(hap.Characteristic.Saturation);
     }
+
+    this.onService.getCharacteristic(hap.Characteristic.Hue)
+  .setProps({
+    minValue: 0,
+    maxValue: 360,
+    minStep: 1,
+  });
+  this.onService.getCharacteristic(hap.Characteristic.Saturation)
+  .setProps({
+    minValue: 0,
+    maxValue: 100,
+    minStep: 1,
+  });
+
+this.onService.getCharacteristic(hap.Characteristic.Brightness)
+  .setProps({
+    minValue: 0,
+    maxValue: 100,
+    minStep: 1,
+  });
     this.onService
     .getCharacteristic(hap.Characteristic.Hue)
     .onSet(this.setPrimaryHue.bind(this));
-  this.onService
+    this.onService
     .getCharacteristic(hap.Characteristic.Saturation)
     .onSet(this.setPrimarySaturation.bind(this));
+    this.onService
+    .getCharacteristic(hap.Characteristic.Brightness)
+    .onSet(this.setPrimaryBrightness.bind(this));
     
     this.onService.setPrimaryService(true);
     this.onService.updateCharacteristic(hap.Characteristic.On, this.isOn);
@@ -547,6 +572,7 @@ class ZenggeLedStripPlatformAccessory {
     async setPrimaryColor(): Promise<void> {
     const hue = this.onService.getCharacteristic(hap.Characteristic.Hue).value as number;
     const saturation = this.onService.getCharacteristic(hap.Characteristic.Saturation).value as number;
+    const brightness = this.onService.getCharacteristic(hap.Characteristic.Brightness).value as number;
 
     // Désactiver tous les stops sauf le premier et le dernier
     this.sortedColorStops.forEach((stop, index) => {
@@ -556,9 +582,11 @@ class ZenggeLedStripPlatformAccessory {
     
     this.primaryHue = hue;
     this.primarySaturation = saturation;
+    this.primaryBrightness = brightness;
 
     this.log(`Hue principale mise à jour: ${hue}`);
     this.log(`Saturation principale mise à jour: ${saturation}`);
+    this.log(`Brightness principale mise à jour: ${brightness}`);
     
     // Exemple : propager la valeur aux stops activés
     this.sortedColorStops.forEach((stop, index) => {
@@ -566,13 +594,24 @@ class ZenggeLedStripPlatformAccessory {
       stop.hue = this.primaryHue;
       stop.saturation = this.primarySaturation;
       // On recalcul la couleur en fonction de la nouvelle teinte et saturation (avec luminosité fixe, ici 50%)
-      stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
+      stop.color = this.hsvToHex(stop.hue, stop.saturation, stop.brightness);
       stop.service.updateCharacteristic(hap.Characteristic.Hue, this.primaryHue);
       stop.service.updateCharacteristic(hap.Characteristic.Saturation, this.primarySaturation);
+      stop.service.updateCharacteristic(hap.Characteristic.Brightness, this.primaryBrightness);
       }
     });
     await this.updateGradientFromColorStops();
     }
+
+
+async setPrimaryBrightness(value: CharacteristicValue): Promise<void> {
+  this.primaryBrightness = value as number;
+  this.onService.updateCharacteristic(hap.Characteristic.Brightness, this.primaryBrightness);
+  this.log(`Brightness principale mise à jour: ${this.primaryBrightness}`);
+  // Ici, vous pouvez propager la valeur aux stops si nécessaire ou l'utiliser dans le calcul
+  this.updateActiveColorStops(); // par exemple
+  await this.updateGradientFromColorStops();
+}
 
     // Puis, définissez les fonctions de callback :
 async setPrimaryHue(value: CharacteristicValue): Promise<void> {
@@ -601,7 +640,7 @@ private updateActiveColorStops(): void {
       stop.hue = this.primaryHue;
       stop.saturation = this.primarySaturation;
       // Calcul de la couleur avec une luminosité fixe (ici 50%)
-      stop.color = this.hslToHex(stop.hue, stop.saturation, 50);
+      stop.color = this.hsvToHex(stop.hue, stop.saturation, stop.brightness);
       stop.service.updateCharacteristic(hap.Characteristic.Hue, stop.hue);
       stop.service.updateCharacteristic(hap.Characteristic.Saturation, stop.saturation);
       stop.service.updateCharacteristic(hap.Characteristic.On, true);
@@ -649,7 +688,35 @@ private updateActiveColorStops(): void {
         .getCharacteristic(hap.Characteristic.Saturation)
         .onSet((value) => this.setColorStopSaturation(i, value))
         .onGet(() => this.getColorStopSaturation(i));
+
+      // Ajout de la caractéristique Brightness
+      if (!colorService.testCharacteristic(hap.Characteristic.Brightness)) {
+        colorService.addCharacteristic(hap.Characteristic.Brightness);
+      }
+      colorService
+        .getCharacteristic(hap.Characteristic.Brightness)
+        .onSet((value) => this.setColorStopBrightness(i, value))
+        .onGet(() => this.getColorStopBrightness(i));
+
+        colorService.getCharacteristic(hap.Characteristic.Hue)
+        .setProps({
+          minValue: 0,
+          maxValue: 360,
+          minStep: 1,
+        });
+        colorService.getCharacteristic(hap.Characteristic.Saturation)
+        .setProps({
+          minValue: 0,
+          maxValue: 100,
+          minStep: 1,
+        });
       
+      colorService.getCharacteristic(hap.Characteristic.Brightness)
+        .setProps({
+          minValue: 0,
+          maxValue: 100,
+          minStep: 1,
+        });
       // Initialisation par défaut : stop désactivé et couleur rouge (Hue = 0, Saturation = 100)
       this.colorStops.push({
         index: i,
@@ -657,6 +724,7 @@ private updateActiveColorStops(): void {
         isOn: false,
         hue: 30, // Hue for warm white
         saturation: 100,
+        brightness: 100,
         color: 'FFD700', // Hex color for warm white
       });
     }
@@ -720,7 +788,7 @@ private updateActiveColorStops(): void {
     this.log(`setColorStopHue for stop ${index + 1} called with value:`, value);
     this.colorStops[index].hue = value as number;
     // Mise à jour de la couleur (en partant d'une luminosité par défaut de 50%)
-    this.colorStops[index].color = this.hslToHex(this.colorStops[index].hue, this.colorStops[index].saturation, 50);
+    this.colorStops[index].color = this.hsvToHex(this.colorStops[index].hue, this.colorStops[index].saturation, 50);
     this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Hue, value);
     await this.updateGradientFromColorStops();
   }
@@ -732,7 +800,7 @@ private updateActiveColorStops(): void {
   async setColorStopSaturation(index: number, value: CharacteristicValue): Promise<void> {
     this.log(`setColorStopSaturation for stop ${index + 1} called with value:`, value);
     this.colorStops[index].saturation = value as number;
-    this.colorStops[index].color = this.hslToHex(this.colorStops[index].hue, this.colorStops[index].saturation, 50);
+    this.colorStops[index].color = this.hsvToHex(this.colorStops[index].hue, this.colorStops[index].saturation, 50);
     this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Saturation, value);
     await this.updateGradientFromColorStops();
   }
@@ -740,54 +808,59 @@ private updateActiveColorStops(): void {
   async getColorStopSaturation(index: number): Promise<CharacteristicValue> {
     return this.colorStops[index].saturation;
   }
-
-  /**
-   * Fonction utilitaire pour convertir des valeurs HSL en une couleur hexadécimale.
-   * @param h Hue (0-360)
-   * @param s Saturation (0-100)
-   * @param l Luminosité (0-100) – ici on utilisera 50% par défaut pour un rendu vif
-   */
-  hsvToHex(h: number, s: number, v: number): string {
-    s /= 100;
-    v /= 100;
-    const c = v * s;
-    const x = c * (1 - Math.abs((h / 60) % 2 - 1));
-    const m = v - c;
-    let r = 0, g = 0, b = 0;
-    if (h < 60) {
-      r = c;
-      g = x;
-      b = 0;
-    } else if (h < 120) {
-      r = x;
-      g = c;
-      b = 0;
-    } else if (h < 180) {
-      r = 0;
-      g = c;
-      b = x;
-    } else if (h < 240) {
-      r = 0;
-      g = x;
-      b = c;
-    } else if (h < 300) {
-      r = x;
-      g = 0;
-      b = c;
-    } else {
-      r = c;
-      g = 0;
-      b = x;
-    }
-    const R = Math.round((r + m) * 255);
-    const G = Math.round((g + m) * 255);
-    const B = Math.round((b + m) * 255);
-    return (
-      R.toString(16).toUpperCase().padStart(2, "0") +
-      G.toString(16).toUpperCase().padStart(2, "0") +
-      B.toString(16).toUpperCase().padStart(2, "0")
-    );
+  async setColorStopBrightness(index: number, value: CharacteristicValue): Promise<void> {
+    this.log(`setColorStopBrightness for stop ${index + 1} called with value:`, value);
+    this.colorStops[index].brightness = value as number;
+    this.colorStops[index].color = this.hsvToHex(this.colorStops[index].hue, this.colorStops[index].saturation, this.colorStops[index].brightness);
+    this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Brightness, value);
+    await this.updateGradientFromColorStops();
   }
+
+  async getColorStopBrightness(index: number): Promise<CharacteristicValue> {
+    return this.colorStops[index].brightness;
+  }
+
+hsvToHex(h: number, s: number, v: number): string {
+  s /= 100;
+  v /= 100;
+  const c = v * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = v - c;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) {
+    r = c;
+    g = x;
+    b = 0;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+    b = 0;
+  } else if (h < 180) {
+    r = 0;
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    r = 0;
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    g = 0;
+    b = c;
+  } else {
+    r = c;
+    g = 0;
+    b = x;
+  }
+  const R = Math.round((r + m) * 255);
+  const G = Math.round((g + m) * 255);
+  const B = Math.round((b + m) * 255);
+  return (
+    R.toString(16).toUpperCase().padStart(2, "0") +
+    G.toString(16).toUpperCase().padStart(2, "0") +
+    B.toString(16).toUpperCase().padStart(2, "0")
+  );
+}
 
   /**
    * Calcule le dégradé à envoyer en se basant sur les color stops activés.
@@ -824,81 +897,147 @@ private updateActiveColorStops(): void {
    * @param mode Le mode de trame (détermine header/footer)
    * @param stops La liste des stops triés (chaque stop a une couleur et une position)
    */
-  async setCustomGradient(
-    mode: number,
-    stops: Array<{ color: string; pos: number }>
-  ): Promise<void> {
-    // S'assurer que les stops sont triés par position croissante
-    stops.sort((a, b) => a.pos - b.pos);
-  
-    let header: string;
-    let footer: string;
-    switch (mode) {
-      case 1:
-        header = "002880000063640B590063";
-        footer = "001E016400BF";
-        break;
-      case 2:
-        header = "000880000063640B590063";
-        footer = "001E02360043";
-        break;
-      case 3:
-        header = "001C80000063640B590063";
-        footer = "001E02640064";
-        break;
-      default:
-        this.logger.error("Mode invalide:", mode);
-        return;
-    }
-    
-    const numWords = 30;
-    let gradientTable = "";
-    
-    for (let i = 0; i < numWords; i++) {
-      const t = i / (numWords - 1);
-      let lower = stops[0],
-          upper = stops[stops.length - 1];
-      for (let j = 0; j < stops.length - 1; j++) {
-        if (t >= stops[j].pos && t <= stops[j + 1].pos) {
-          lower = stops[j];
-          upper = stops[j + 1];
-          break;
-        }
-      }
-      const localT = lower.pos === upper.pos ? 0 : (t - lower.pos) / (upper.pos - lower.pos);
-      
-      const formatColor = (col: string) => (col.startsWith("#") ? col.slice(1) : col);
-      const lc = formatColor(lower.color);
-      const uc = formatColor(upper.color);
-      const rLower = parseInt(lc.slice(0, 2), 16);
-      const gLower = parseInt(lc.slice(2, 4), 16);
-      const bLower = parseInt(lc.slice(4, 6), 16);
-      const rUpper = parseInt(uc.slice(0, 2), 16);
-      const gUpper = parseInt(uc.slice(2, 4), 16);
-      const bUpper = parseInt(uc.slice(4, 6), 16);
-      
-      const r = Math.round(rLower + (rUpper - rLower) * localT);
-      const g = Math.round(gLower + (gUpper - gLower) * localT);
-      const b = Math.round(bLower + (bUpper - bLower) * localT);
-      
-      // Ordre GRB attendu par le contrôleur
-      const word =
-        r.toString(16).toUpperCase().padStart(2, "0") +
-        g.toString(16).toUpperCase().padStart(2, "0") +
-        b.toString(16).toUpperCase().padStart(2, "0");
-      gradientTable += word;
-    }
-    
-    const commandHex = header + gradientTable + footer;
-    if (commandHex.length !== 214) {
-      this.logger.error(
-        `La trame générée contient ${commandHex.length} caractères (attendu: 214).`
-      );
+  /**
+ * Génère la trame pour le dégradé en interpolant les couleurs en espace HSL.
+ *
+ * @param mode Le mode de trame (détermine header/footer)
+ * @param stops La liste des stops triés (chaque stop a une couleur au format hex "RRGGBB" et une position entre 0 et 1)
+ */
+async setCustomGradient(
+  mode: number,
+  stops: Array<{ color: string; pos: number }>
+): Promise<void> {
+  // S'assurer que les stops sont triés par position croissante
+  stops.sort((a, b) => a.pos - b.pos);
+
+  let header: string;
+  let footer: string;
+  switch (mode) {
+    case 1:
+      header = "002880000063640B590063";
+      footer = "001E016400BF";
+      break;
+    case 2:
+      header = "000880000063640B590063";
+      footer = "001E02360043";
+      break;
+    case 3:
+      header = "001C80000063640B590063";
+      footer = "001E02640064";
+      break;
+    default:
+      this.logger.error("Mode invalide:", mode);
       return;
-    }
-    
-    const command = Buffer.from(commandHex, "hex");
-    this.log("Setting gradient with command:", commandHex, `(${commandHex.length} caractères)`);
-    await this.sendCommand(command);
   }
+
+  const numWords = 30;
+  let gradientTable = "";
+
+  for (let i = 0; i < numWords; i++) {
+    const t = i / (numWords - 1);
+
+    // Détermine les stops de part et d'autre de t
+    let lowerStop = stops[0],
+      upperStop = stops[stops.length - 1];
+    for (let j = 0; j < stops.length - 1; j++) {
+      if (t >= stops[j].pos && t <= stops[j + 1].pos) {
+        lowerStop = stops[j];
+        upperStop = stops[j + 1];
+        break;
+      }
+    }
+    const localT =
+      lowerStop.pos === upperStop.pos
+        ? 0
+        : (t - lowerStop.pos) / (upperStop.pos - lowerStop.pos);
+
+    // Convertir les couleurs hex en HSL
+    const lowerHSL = this.hexToHsl(lowerStop.color);
+    const upperHSL = this.hexToHsl(upperStop.color);
+
+    // Interpoler chaque composante (pour la teinte, on tient compte de la circularité)
+    const interpolatedHue = this.interpolateHue(lowerHSL.h, upperHSL.h, localT);
+    const interpolatedSaturation =
+      lowerHSL.s + (upperHSL.s - lowerHSL.s) * localT;
+    const interpolatedLuminance =
+      lowerHSL.l + (upperHSL.l - lowerHSL.l) * localT;
+
+    // Convertir la couleur interpolée en hex (sans le '#')
+    const interpolatedHex = this.hsvToHex(
+      interpolatedHue,
+      interpolatedSaturation,
+      interpolatedLuminance
+    );
+
+    gradientTable += interpolatedHex;
+  }
+
+  const commandHex = header + gradientTable + footer;
+  if (commandHex.length !== 214) {
+    this.logger.error(
+      `La trame générée contient ${commandHex.length} caractères (attendu: 214).`
+    );
+    return;
+  }
+
+  const command = Buffer.from(commandHex, "hex");
+  this.log(
+    "Setting gradient with command:",
+    commandHex,
+    `(${commandHex.length} caractères)`
+  );
+  await this.sendCommand(command);
+}
+
+/**
+ * Convertit une couleur hexadécimale (RRGGBB) en HSL.
+ * Retourne un objet avec h (0-360), s et l (0-100).
+ */
+private hexToHsl(hex: string): { h: number; s: number; l: number } {
+  // Supprimer '#' si présent
+  hex = hex.replace(/^#/, "");
+  if (hex.length === 3) {
+    hex = hex
+      .split("")
+      .map((c) => c + c)
+      .join("");
+  }
+  const r = parseInt(hex.substring(0, 2), 16) / 255;
+  const g = parseInt(hex.substring(2, 4), 16) / 255;
+  const b = parseInt(hex.substring(4, 6), 16) / 255;
+
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  let h = 0,
+    s = 0;
+  const l = (max + min) / 2;
+
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0);
+        break;
+      case g:
+        h = (b - r) / d + 2;
+        break;
+      case b:
+        h = (r - g) / d + 4;
+        break;
+    }
+    h /= 6;
+  }
+  return { h: h * 360, s: s * 100, l: l * 100 };
+}
+
+/**
+ * Interpole linéairement la teinte en tenant compte de la circularité (0° = 360°).
+ */
+private interpolateHue(h1: number, h2: number, t: number): number {
+  let delta = h2 - h1;
+  if (delta > 180) delta -= 360;
+  if (delta < -180) delta += 360;
+  return (h1 + t * delta + 360) % 360;
+}
 }
