@@ -1,16 +1,7 @@
-# Ignore source code
-src
-
 # ------------- Defaults ------------- #
 
 # gitHub actions
 .github
-
-# eslint
-eslint.config.js
-
-# typescript
-tsconfig.json
 
 # vscode
 .vscode
