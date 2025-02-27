@@ -12,14 +12,14 @@
     "ble"
   ],
   "peerDependencies": {
-    "homebridge": "^2.0.0-beta.0"
+    "homebridge": ">2.0.0-beta.0"
   },
   "engines": {
-    "node": "^v18.18.0",
+    "node": "18.x",
     "homebridge": "^1.8.0 || ^2.0.0-beta.0"
   },
   "dependencies": {
-    "@abandonware/noble": "^1.9.2-25"
+    "@abandonware/noble": "^1.9.2-26"
   },
   "devDependencies": {
     "@types/node": "^12.11.7",
