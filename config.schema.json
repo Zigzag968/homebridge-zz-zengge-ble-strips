@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "homebridge-zz-zengge-ble-strips",
+  "pluginAlias": "HomebridgeZzZenggeBleStrips",
   "pluginType": "platform",
   "singular": true,
   "schema": {
