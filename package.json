@@ -32,6 +32,6 @@
     "build": "tsc",
     "watch": "nodemon",
     "prepublishOnly": "npm i --package-lock-only && npm audit && npm run build",
-    "prepare": "npm run build"
+    "prepare": "npm install && npm run build"
   }
 }
