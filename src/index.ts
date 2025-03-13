@@ -686,8 +686,10 @@ class ZenggeLedStripPlatformAccessory {
 
   async setOn(value: CharacteristicValue): Promise<void> {
     this.log('setOn called with value:', value);
-    await this.setPower(value as boolean);
-    if (value) {
+    await this.setPower(value);
+    if (value === true) {
+      // Augmentez le délai pour vous assurer que le ruban a bien alimenté
+      await new Promise(resolve => setTimeout(resolve, 500)); // Passez de 500ms à 1000ms
       await this.updateGradientFromColorStops();
     }
   }
