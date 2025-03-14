@@ -160,7 +160,7 @@ class BluetoothCommunicator {
         // Already connected; no need to update the cache.
         return;
       }
-      
+
       const now = Date.now();
       const lastTime = this.lastDiscoveryTime.get(address) || 0;
       if (now - lastTime < 10000) { // 10-second debounce
@@ -471,6 +471,7 @@ class ZenggeLedStripPlatformAccessory {
   private accessory: PlatformAccessory;
   private isOn: boolean = false;
   private onService!: Service;
+  private gradientUpdateTimeout: NodeJS.Timeout | null = null;
 
   // Gestion des color stops
   private colorStops: ColorStop[] = [];
@@ -575,7 +576,7 @@ class ZenggeLedStripPlatformAccessory {
     this.onService.updateCharacteristic(hap.Characteristic.Hue, this.primaryHue);
     this.log(`Primary Hue updated: ${this.primaryHue}`);
     this.updateActiveColorStops();
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   async setPrimarySaturation(value: CharacteristicValue): Promise<void> {
@@ -583,7 +584,7 @@ class ZenggeLedStripPlatformAccessory {
     this.onService.updateCharacteristic(hap.Characteristic.Saturation, this.primarySaturation);
     this.log(`Primary Saturation updated: ${this.primarySaturation}`);
     this.updateActiveColorStops();
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   async setPrimaryBrightness(value: CharacteristicValue): Promise<void> {
@@ -591,7 +592,7 @@ class ZenggeLedStripPlatformAccessory {
     this.onService.updateCharacteristic(hap.Characteristic.Brightness, this.primaryBrightness);
     this.log(`Primary Brightness updated: ${this.primaryBrightness}`);
     this.updateActiveColorStops();
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   // Optionnelle : mise à jour groupée de la couleur primaire
@@ -604,7 +605,7 @@ class ZenggeLedStripPlatformAccessory {
     this.primaryBrightness = brightness;
     this.log(`Primary color updated: Hue=${hue}, Sat=${saturation}, Bri=${brightness}`);
     this.updateActiveColorStops();
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   // Propager les valeurs primaires aux stops actifs (premier et dernier)
@@ -711,12 +712,22 @@ class ZenggeLedStripPlatformAccessory {
     if (value === true) {
       // Augmentez le délai pour vous assurer que le ruban a bien alimenté
       await new Promise(resolve => setTimeout(resolve, 500)); // Passez de 500ms à 1000ms
-      await this.updateGradientFromColorStops();
+      await this.scheduleGradientUpdate();
     }
   }
 
   async getOn(): Promise<CharacteristicValue> {
     return this.isOn;
+  }
+
+  async scheduleGradientUpdate(): Promise<void> {
+    if (this.gradientUpdateTimeout) {
+      clearTimeout(this.gradientUpdateTimeout);
+    }
+    // Wait 500ms (adjust as needed) before updating the gradient.
+    this.gradientUpdateTimeout = setTimeout(async () => {
+      await this.updateGradientFromColorStops();
+    }, 500);
   }
 
   // Gestion des color stops
@@ -725,7 +736,7 @@ class ZenggeLedStripPlatformAccessory {
     this.log(`setColorStopOn for stop ${index + 1} called with value:`, value);
     this.colorStops[index].isOn = value as boolean;
     this.colorStops[index].service.updateCharacteristic(hap.Characteristic.On, value);
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   async getColorStopOn(index: number): Promise<CharacteristicValue> {
@@ -741,7 +752,7 @@ class ZenggeLedStripPlatformAccessory {
       this.colorStops[index].brightness
     );
     this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Hue, value);
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   async getColorStopHue(index: number): Promise<CharacteristicValue> {
@@ -757,7 +768,7 @@ class ZenggeLedStripPlatformAccessory {
       this.colorStops[index].brightness
     );
     this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Saturation, value);
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   async getColorStopSaturation(index: number): Promise<CharacteristicValue> {
@@ -773,7 +784,7 @@ class ZenggeLedStripPlatformAccessory {
       this.colorStops[index].brightness
     );
     this.colorStops[index].service.updateCharacteristic(hap.Characteristic.Brightness, value);
-    await this.updateGradientFromColorStops();
+    await this.scheduleGradientUpdate();
   }
 
   async getColorStopBrightness(index: number): Promise<CharacteristicValue> {
