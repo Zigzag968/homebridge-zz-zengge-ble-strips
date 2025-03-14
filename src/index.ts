@@ -31,6 +31,7 @@ class BluetoothCommunicator {
   private readonly config: PlatformConfig;
   private readonly peripherals: Map<string, Peripheral> = new Map();
   private readonly characteristics: Map<string, any> = new Map();
+  private lastDiscoveryTime: Map<string, number> = new Map();
 
   constructor(log: Logger, config: PlatformConfig) {
     this.log = log;
@@ -49,16 +50,18 @@ class BluetoothCommunicator {
       this.log.error(`Peripheral with address ${address} not found.`);
       return;
     }
-
+    if (peripheral.state === 'connected') {
+      this.log.info(`Device ${address} is already connected. Skipping reconnection.`);
+      return;
+    }
     try {
-      await peripheral.connectAsync().then(async () => {
-        this.log.info(`Connected to device: ${address}`);
-        setTimeout(async () => {
-          await this.discoverWriteCharacteristics(peripheral, address);
-          await this.enableNotifications(peripheral, address);
-          this.log.info('Device setup complete.');
-        }, 500);
-      });
+      await peripheral.connectAsync();
+      this.log.info(`Connected to device: ${address}`);
+      setTimeout(async () => {
+        await this.discoverWriteCharacteristics(peripheral, address);
+        await this.enableNotifications(peripheral, address);
+        this.log.info('Device setup complete.');
+      }, 500);
     } catch (error) {
       this.log.error(`Error connecting to device ${address}:`, error);
     }
@@ -122,52 +125,70 @@ class BluetoothCommunicator {
     });
 
 
-  let attemptCount = 0;
-  let interval = 5000;
-
-  setInterval(() => {
-    const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
-    const missingDevices = expectedDevices.filter((addr: string) => {
-    const peripheral = this.peripherals.get(addr);
-    return !peripheral || peripheral.state !== 'connected';
-    });
-
-    if (missingDevices.length > 0) {
-    this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
-    this.startBluetoothScanning();
-    attemptCount++;
-    if (attemptCount > 5) {
-      const intervals = [5000, 1800000, 3600000];
-      interval = attemptCount <= 5 ? intervals[0] : attemptCount <= 10 ? intervals[1] : intervals[2];
-    }
-    } else {
-    attemptCount = 0;
-    interval = 5000;
-    }
-  }, interval);
+    let attemptCount = 0;
+    let scanInterval = 15000; // Increase interval to 15 seconds
+    
+    setInterval(() => {
+      const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
+      const missingDevices = expectedDevices.filter((addr: string) => {
+        const peripheral = this.peripherals.get(addr);
+        if (!peripheral) {
+          this.log.warn(`Device ${addr} not found in cache.`);
+          return true;
+        }
+        if (peripheral.state !== 'connected') {
+          this.log.warn(`Device ${addr} state is ${peripheral.state} instead of connected.`);
+          return true;
+        }
+        return false;
+      });
+      if (missingDevices.length > 0) {
+        this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
+        this.startBluetoothScanning();
+        attemptCount++;
+      } else {
+        attemptCount = 0;
+      }
+    }, scanInterval);
   }
 
-  private deviceDiscovered(peripheral: Peripheral) {
-    if (peripheral.state === 'connected') {
-      return;
+    private deviceDiscovered(peripheral: Peripheral) {
+      const address = peripheral.address.toLowerCase();
+
+      const cachedPeripheral = this.peripherals.get(address);
+      if (cachedPeripheral && cachedPeripheral.state === 'connected') {
+        // Already connected; no need to update the cache.
+        return;
+      }
+      
+      const now = Date.now();
+      const lastTime = this.lastDiscoveryTime.get(address) || 0;
+      if (now - lastTime < 10000) { // 10-second debounce
+        return;
+      }
+      this.lastDiscoveryTime.set(address, now);
+      this.log.info(`Discovered new device: ${address}`);
+      this.peripherals.set(address, peripheral);
+      this.connectToDevice(address).then(() => {
+        this.startBluetoothScanning();
+      });
     }
-    const address = peripheral.address.toLowerCase();
-    this.log.info(`Discovered new device: ${address}`);
-    this.peripherals.set(address.toLowerCase(), peripheral);
-    this.connectToDevice(address).then(() => {
-      this.startBluetoothScanning();
-    });
-  }
 
   public async sendCommand(address: string, command: Buffer): Promise<void> {
     this.log.debug('sendCommand', command);
-
     const characteristic = this.characteristics.get(address.toLowerCase());
     if (!characteristic) {
       this.log.error(`No characteristic available for device: ${address}`);
       return;
     }
-
+    
+    // Ensure the peripheral is connected
+    const peripheral = this.peripherals.get(address.toLowerCase());
+    if (!peripheral || peripheral.state !== 'connected') {
+      this.log.warn(`Device ${address} not connected. Attempting to reconnect...`);
+      await this.connectToDevice(address);
+    }
+    
     try {
       await characteristic.write(command, true);
       this.log.info(`Command sent to device: ${address}`);
@@ -686,7 +707,7 @@ class ZenggeLedStripPlatformAccessory {
 
   async setOn(value: CharacteristicValue): Promise<void> {
     this.log('setOn called with value:', value);
-    await this.setPower(value);
+    await this.setPower(value as boolean);
     if (value === true) {
       // Augmentez le délai pour vous assurer que le ruban a bien alimenté
       await new Promise(resolve => setTimeout(resolve, 500)); // Passez de 500ms à 1000ms
