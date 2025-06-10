@@ -17,261 +17,245 @@ const PACKAGE_NAME = 'homebridge-zz-zengge-ble-strips';
 
 let hap: HAP;
 
-const serviceUUID: string = 'ffff';
-const writeUUID: string = 'ff01';
-const notifyUUID: string = 'ff02';
-
 module.exports = (homebridge: API) => {
   hap = homebridge.hap;
   homebridge.registerPlatform(PLATFORM_NAME, ZenggeLedStripPlatform);
 };
 
+const BLE_SERVICE_UUID = 'ffff';
+const BLE_WRITE_UUID = 'ff01';
+const BLE_NOTIFY_UUID = 'ff02';
+const BLE_CONNECT_RETRIES = 3;
+const BLE_BACKOFF_BASE = 500; 
+const BLE_MONITOR_INTERVAL = 5000;
+const BLE_DISCOVERY_DEBOUNCE = 10000;
+
+interface DeviceState {
+  peripheral?: Peripheral;
+  attempts: number;
+  lastDiscovery: number;
+  characteristic?: any;
+}
+
 class BluetoothCommunicator {
   private readonly log: Logger;
   private readonly config: PlatformConfig;
-  private readonly peripherals: Map<string, Peripheral> = new Map();
-  private readonly characteristics: Map<string, any> = new Map();
-  private lastDiscoveryTime: Map<string, number> = new Map();
+  private readonly devices: Map<string, DeviceState> = new Map();
+  private readonly connecting: Set<string> = new Set();
+  private isReconnecting: boolean = false;
+  private configuredAddresses: string[] = [];
 
   constructor(log: Logger, config: PlatformConfig) {
     this.log = log;
     this.config = config;
-    this.setupNobleObservers();
+    this.configuredAddresses = (config.devices || []).map((d: any) => d.address.toLowerCase());
+    this.setupNoble();
   }
 
+  // Start scanning for BLE devices
   startBluetoothScanning() {
     noble.startScanning([], false);
-    this.log.info('Started Bluetooth scanning.');
   }
 
+  // Connect to a device by address, setup characteristic and notifications
   async connectToDevice(address: string): Promise<void> {
-    const peripheral = this.peripherals.get(address.toLowerCase());
-    if (!peripheral) {
-      this.log.error(`Peripheral with address ${address} not found.`);
+    const addr = address.toLowerCase();
+    const state = this.devices.get(addr) || { attempts: 0, lastDiscovery: 0 };
+    if (this.connecting.has(addr)) return;
+    if (!state.peripheral) {
+      this.log.warn(`Peripheral with address ${address} not found.`);
       return;
     }
-    
-    if (peripheral.state === 'connected') {
-      this.log.info(`Device ${address} is already connected. Skipping reconnection.`);
+    if (state.peripheral.state === 'connected') {
+      this.log.debug(`Device ${address} already connected.`);
       return;
     }
-    
-    // If the peripheral is in 'connecting' state for too long, disconnect it first
-    if (peripheral.state === 'connecting') {
+    this.connecting.add(addr);
+    try {
+      await this.retryWithBackoff(async () => {
+        await state.peripheral!.connectAsync();
+      }, BLE_CONNECT_RETRIES, addr);
+      this.logDevice(addr, 'Connected');
+      await new Promise(r => setTimeout(r, 350));
+      state.characteristic = await this.discoverWriteCharacteristic(state.peripheral!, addr);
+      await new Promise(r => setTimeout(r, 200));
+      await this.enableNotification(state.peripheral!, addr);
+      state.attempts = 0;
+      // Handle disconnect
+      state.peripheral!.removeAllListeners('disconnect');
+      state.peripheral!.once('disconnect', () => this.handleDisconnect(addr));
+      this.devices.set(addr, state);
+    } catch (e) {
+      state.attempts++;
+      this.log.error(`Error connecting to ${address}:`, e);
+      this.devices.set(addr, state);
+    } finally {
+      this.connecting.delete(addr);
+    }
+  }
+
+  // Exponential backoff retry helper
+  private async retryWithBackoff(fn: () => Promise<void>, retries: number, addr: string): Promise<void> {
+    let lastErr;
+    for (let i = 0; i < retries; i++) {
       try {
-        this.log.info(`Device ${address} is stuck in connecting state. Disconnecting first...`);
-        await peripheral.disconnectAsync();
-        // Wait a bit before reconnecting
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch (error) {
-        this.log.error(`Error disconnecting device ${address}:`, error);
+        await fn();
+        return;
+      } catch (e) {
+        lastErr = e;
+        this.log.warn(`Retry ${i + 1}/${retries} for ${addr}`);
+        await new Promise(r => setTimeout(r, BLE_BACKOFF_BASE * (i + 1)));
       }
     }
-    
+    throw lastErr;
+  }
+
+  // On device disconnect, clear state and schedule reconnect
+  private handleDisconnect(addr: string) {
+    const state = this.devices.get(addr);
+    if (state) {
+      this.logDevice(addr, 'Disconnected');
+      state.characteristic = undefined;
+      state.attempts = 0;
+      this.devices.set(addr, state);
+    }
+  }
+
+  // Discover the write characteristic for a device
+  private async discoverWriteCharacteristic(peripheral: Peripheral, addr: string): Promise<any | undefined> {
     try {
-      // Set a timeout for the connection attempt
-      const connectionPromise = peripheral.connectAsync();
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Connection timeout')), 10000)
+      const { characteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
+        [BLE_SERVICE_UUID], [BLE_WRITE_UUID]
       );
-      
-      await Promise.race([connectionPromise, timeoutPromise]);
-      
-      this.log.info(`Connected to device: ${address}`);
-      
-      // Wait longer before service discovery
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      
-      await this.discoverWriteCharacteristics(peripheral, address);
-      await this.enableNotifications(peripheral, address);
-      this.log.info(`Device setup complete for: ${address}`);
-    } catch (error) {
-      this.log.error(`Error connecting to device ${address}:`, error);
-      
-      // Attempt to clean up after a failed connection
-      try {
-        if (peripheral.state !== 'disconnected') {
-          await peripheral.disconnectAsync();
-        }
-      } catch (disconnectError) {
-        this.log.error(`Error disconnecting after failed connection: ${disconnectError}`);
+      if (characteristics.length > 0) {
+        this.logDevice(addr, `Write characteristic discovered: ${characteristics[0].uuid}`);
+        return characteristics[0];
       }
+      this.log.error(`No write characteristic found for ${addr}`);
+    } catch (e) {
+      this.log.error(`Error discovering write characteristic for ${addr}:`, e);
     }
+    return undefined;
   }
 
-  private async discoverWriteCharacteristics(peripheral: Peripheral, address: string) {
-    const { characteristics: writeCharacteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
-      [serviceUUID],
-      [writeUUID]
-    );
-
-    if (writeCharacteristics.length > 0) {
-      const characteristic = writeCharacteristics[0];
-      this.characteristics.set(address.toLowerCase(), characteristic);
-      this.log.info(`Write characteristic (${characteristic.uuid}) discovered for device: ${address}`);
-    } else {
-      this.log.error(`No write characteristics found for device: ${address}`);
-    }
-  }
-
-  private async enableNotifications(peripheral: Peripheral, address: string) {
-    const { characteristics: notifyCharacteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
-      [serviceUUID],
-      [notifyUUID]
-    );
-
-    if (notifyCharacteristics.length > 0) {
-      const notifyCharacteristic = notifyCharacteristics[0];
-      notifyCharacteristic.on('data', (data: any) => {
-        this.log.info(`Notification received from ${address}: ${data.toString('hex')}`);
-      });
-    let attemptCount = 0;
-    let scanInterval = 30000; // Increase interval to 30 seconds
-    let lastConnectionAttempts: Map<string, number> = new Map();
-    const connectionCooldown = 60000; // 1 minute cooldown between connection attempts for the same device
-    
-    setInterval(() => {
-      const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
-      const missingDevices = expectedDevices.filter((addr: string) => {
-        const peripheral = this.peripherals.get(addr);
-        if (!peripheral) {
-          this.log.warn(`Device ${addr} not found in cache.`);
-          return true;
-        }
-        if (peripheral.state !== 'connected') {
-          this.log.warn(`Device ${addr} state is ${peripheral.state} instead of connected.`);
-          return true;
-        }
-        return false;
-      });
-      
-      if (missingDevices.length > 0) {
-        this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
-        
-        // Start scanning only if not already scanning
-        noble.startScanningAsync().catch(err => {
-          this.log.error('Error starting scan:', err);
+  // Enable notification for a device
+  private async enableNotification(peripheral: Peripheral, addr: string): Promise<void> {
+    try {
+      const { characteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
+        [BLE_SERVICE_UUID], [BLE_NOTIFY_UUID]
+      );
+      if (characteristics.length > 0) {
+        const notifyChar = characteristics[0];
+        notifyChar.on('data', (data: Buffer) => {
+          this.log.debug(`Notification from ${addr}: ${data.toString('hex')}`);
         });
-    private deviceDiscovered(peripheral: Peripheral) {
-        const address = peripheral.address.toLowerCase();
-  
-        const cachedPeripheral = this.peripherals.get(address);
-        if (cachedPeripheral && cachedPeripheral.state === 'connected') {
-          // Already connected; no need to update the cache.
-          return;
-        }
-  
-        const now = Date.now();
-        const lastTime = this.lastDiscoveryTime.get(address) || 0;
-        if (now - lastTime < 10000) { // 10-second debounce
-          // Skip logging to reduce log spam
-          return;
-        }
-        
-        this.lastDiscoveryTime.set(address, now);
-        
-        // Update peripheral in cache even if we're not connecting yet
-        this.peripherals.set(address, peripheral);
-        
-        // Only log discovery once per session
-        if (!cachedPeripheral) {
-          this.log.info(`Discovered device: ${address}`);
-        }
-        
-        // Only try to connect if the device is not already connecting
-        if (cachedPeripheral?.state !== 'connecting') {
-          this.connectToDevice(address).catch(err => {
-            this.log.error(`Error in connection process for ${address}:`, err);
+        await new Promise<void>((resolve, reject) => {
+          notifyChar.subscribe((err: any) => {
+            if (err) reject(err); else resolve();
           });
-        }
-      }
-        if (attemptCount > 10) {
-          this.log.warn(`Multiple connection attempts failed. Backing off...`);
-          // Wait longer between retries after multiple failures
-          lastConnectionAttempts.forEach((value, key) => {
-            lastConnectionAttempts.set(key, now);
-          });
-        }
+        });
+        this.logDevice(addr, 'Notifications enabled');
       } else {
-        attemptCount = 0;
+        this.log.error(`No notify characteristic found for ${addr}`);
       }
-    }, scanInterval);
-      const address = peripheral.address.toLowerCase();
-      if (this.config.devices.some((device: any) => device.address.toLowerCase() === address)) {
-        this.deviceDiscovered(peripheral);
-      }
-    });
-
-
-    let attemptCount = 0;
-    let scanInterval = 15000; // Increase interval to 15 seconds
-    
-    setInterval(() => {
-      const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
-      const missingDevices = expectedDevices.filter((addr: string) => {
-        const peripheral = this.peripherals.get(addr);
-        if (!peripheral) {
-          this.log.warn(`Device ${addr} not found in cache.`);
-          return true;
-        }
-        if (peripheral.state !== 'connected') {
-          this.log.warn(`Device ${addr} state is ${peripheral.state} instead of connected.`);
-          return true;
-        }
-        return false;
-      });
-      if (missingDevices.length > 0) {
-        this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
-        this.startBluetoothScanning();
-        attemptCount++;
-      } else {
-        attemptCount = 0;
-      }
-    }, scanInterval);
+    } catch (e) {
+      this.log.error(`Error enabling notifications for ${addr}:`, e);
+    }
   }
 
-    private deviceDiscovered(peripheral: Peripheral) {
-      const address = peripheral.address.toLowerCase();
+  // Utility: log device with address
+  private logDevice(addr: string, msg: string) {
+    this.log.info(`[BLE][${addr}] ${msg}`);
+  }
 
-      const cachedPeripheral = this.peripherals.get(address);
-      if (cachedPeripheral && cachedPeripheral.state === 'connected') {
-        // Already connected; no need to update the cache.
-        return;
-      }
-
-      const now = Date.now();
-      const lastTime = this.lastDiscoveryTime.get(address) || 0;
-      if (now - lastTime < 10000) { // 10-second debounce
-        return;
-      }
-      this.lastDiscoveryTime.set(address, now);
-      this.log.info(`Discovered new device: ${address}`);
-      this.peripherals.set(address, peripheral);
-      this.connectToDevice(address).then(() => {
-        this.startBluetoothScanning();
-      });
+  // Device discovered event
+  private deviceDiscovered(peripheral: Peripheral) {
+    const addr = peripheral.address.toLowerCase();
+    // Only process configured devices
+    if (!this.configuredAddresses.includes(addr)) return;
+    const now = Date.now();
+    const state = this.devices.get(addr) || { attempts: 0, lastDiscovery: 0 };
+    // Debounce discoveries
+    if (now - state.lastDiscovery < BLE_DISCOVERY_DEBOUNCE) return;
+    state.peripheral = peripheral;
+    state.lastDiscovery = now;
+    this.devices.set(addr, state);
+    this.logDevice(addr, 'Discovered');
+    if (peripheral.state !== 'connected' && !this.connecting.has(addr)) {
+      setTimeout(() => this.connectToDevice(addr), 400);
     }
+  }
 
+  // Setup noble event listeners and monitoring
+  private setupNoble() {
+    noble.on('scanStart', () => this.log.debug('Bluetooth scanning started'));
+    noble.on('scanStop', () => this.log.debug('Bluetooth scanning stopped'));
+    noble.on('stateChange', (state: string) => {
+      this.log.info(`Bluetooth adapter state: ${state}`);
+      if (state === 'poweredOn') this.startBluetoothScanning();
+      else noble.stopScanning();
+    });
+    noble.on('discover', (peripheral: Peripheral) => this.deviceDiscovered(peripheral));
+    setInterval(() => this.monitorConnections(), BLE_MONITOR_INTERVAL);
+  }
+
+  // Monitor and reconnect to any lost devices
+  private async monitorConnections() {
+    if (this.isReconnecting) return;
+    const toConnect: string[] = [];
+    for (const addr of this.configuredAddresses) {
+      const state = this.devices.get(addr);
+      if (!state?.peripheral) continue;
+      if (this.connecting.has(addr)) continue;
+      if (state.peripheral.state !== 'connected') {
+        if (state.attempts < BLE_CONNECT_RETRIES) {
+          toConnect.push(addr);
+        } else {
+          this.log.error(`Max retries reached for ${addr}, skipping reconnect`);
+        }
+      }
+    }
+    if (toConnect.length) {
+      this.isReconnecting = true;
+      try {
+        noble.stopScanning();
+        await new Promise(r => setTimeout(r, 1200));
+        noble.startScanning([], false);
+        for (const addr of toConnect) {
+          await this.connectToDevice(addr);
+        }
+      } finally {
+        this.isReconnecting = false;
+      }
+    }
+  }
+
+  // Send a command to a BLE device
   public async sendCommand(address: string, command: Buffer): Promise<void> {
-    this.log.debug('sendCommand', command);
-    const characteristic = this.characteristics.get(address.toLowerCase());
-    if (!characteristic) {
-      this.log.error(`No characteristic available for device: ${address}`);
+    const addr = address.toLowerCase();
+    const state = this.devices.get(addr);
+    if (!state || !state.characteristic) {
+      this.log.warn(`No characteristic for ${address}, attempting reconnect...`);
+      await this.connectToDevice(address);
+      const updated = this.devices.get(addr);
+      if (!updated?.characteristic) {
+        this.log.error(`No characteristic for ${address} after reconnect`);
+        return;
+      }
+      try {
+        await updated.characteristic.write(command, true);
+        this.log.info(`Command sent to ${address} after reconnect`);
+      } catch (e) {
+        this.log.error(`Failed to send command to ${address}:`, e);
+      }
       return;
     }
-    
-    // Ensure the peripheral is connected
-    const peripheral = this.peripherals.get(address.toLowerCase());
-    if (!peripheral || peripheral.state !== 'connected') {
-      this.log.warn(`Device ${address} not connected. Attempting to reconnect...`);
-      await this.connectToDevice(address);
-    }
-    
     try {
-      await characteristic.write(command, true);
-      this.log.info(`Command sent to device: ${address}`);
-    } catch (error) {
-      this.log.error(`Failed to send command to ${address}:`, error);
+      await state.characteristic.write(command, true);
+      this.log.debug(`Command sent to ${address}`);
+    } catch (e) {
+      this.log.error(`Failed to send command to ${address}:`, e);
+      await this.connectToDevice(address);
     }
   }
 }
