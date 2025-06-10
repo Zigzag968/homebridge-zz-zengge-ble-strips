@@ -50,20 +50,52 @@ class BluetoothCommunicator {
       this.log.error(`Peripheral with address ${address} not found.`);
       return;
     }
+    
     if (peripheral.state === 'connected') {
       this.log.info(`Device ${address} is already connected. Skipping reconnection.`);
       return;
     }
+    
+    // If the peripheral is in 'connecting' state for too long, disconnect it first
+    if (peripheral.state === 'connecting') {
+      try {
+        this.log.info(`Device ${address} is stuck in connecting state. Disconnecting first...`);
+        await peripheral.disconnectAsync();
+        // Wait a bit before reconnecting
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        this.log.error(`Error disconnecting device ${address}:`, error);
+      }
+    }
+    
     try {
-      await peripheral.connectAsync();
+      // Set a timeout for the connection attempt
+      const connectionPromise = peripheral.connectAsync();
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Connection timeout')), 10000)
+      );
+      
+      await Promise.race([connectionPromise, timeoutPromise]);
+      
       this.log.info(`Connected to device: ${address}`);
-      setTimeout(async () => {
-        await this.discoverWriteCharacteristics(peripheral, address);
-        await this.enableNotifications(peripheral, address);
-        this.log.info('Device setup complete.');
-      }, 500);
+      
+      // Wait longer before service discovery
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      await this.discoverWriteCharacteristics(peripheral, address);
+      await this.enableNotifications(peripheral, address);
+      this.log.info(`Device setup complete for: ${address}`);
     } catch (error) {
       this.log.error(`Error connecting to device ${address}:`, error);
+      
+      // Attempt to clean up after a failed connection
+      try {
+        if (peripheral.state !== 'disconnected') {
+          await peripheral.disconnectAsync();
+        }
+      } catch (disconnectError) {
+        this.log.error(`Error disconnecting after failed connection: ${disconnectError}`);
+      }
     }
   }
 
@@ -93,31 +125,77 @@ class BluetoothCommunicator {
       notifyCharacteristic.on('data', (data: any) => {
         this.log.info(`Notification received from ${address}: ${data.toString('hex')}`);
       });
-
-      notifyCharacteristic.subscribe((error: any) => {
-        if (error) {
-          this.log.error(`Error subscribing to notifications for ${address}:`, error);
-        } else {
-          this.log.info(`Notifications enabled for ${address}`);
+    let attemptCount = 0;
+    let scanInterval = 30000; // Increase interval to 30 seconds
+    let lastConnectionAttempts: Map<string, number> = new Map();
+    const connectionCooldown = 60000; // 1 minute cooldown between connection attempts for the same device
+    
+    setInterval(() => {
+      const expectedDevices = this.config.devices.map((d: any) => d.address.toLowerCase());
+      const missingDevices = expectedDevices.filter((addr: string) => {
+        const peripheral = this.peripherals.get(addr);
+        if (!peripheral) {
+          this.log.warn(`Device ${addr} not found in cache.`);
+          return true;
         }
+        if (peripheral.state !== 'connected') {
+          this.log.warn(`Device ${addr} state is ${peripheral.state} instead of connected.`);
+          return true;
+        }
+        return false;
       });
-    } else {
-      this.log.error(`No notify characteristics found for device: ${address}`);
-    }
-  }
-
-  setupNobleObservers() {
-    noble.on('scanStart', () => console.log("Scanning started"));
-    noble.on('scanStop', () => console.log("Scanning stopped"));
-
-    noble.on('stateChange', (state) => {
-      if (state === 'poweredOn') {
-        this.startBluetoothScanning();
-        this.log.info('Started scanning for devices...');
+      
+      if (missingDevices.length > 0) {
+        this.log.warn(`Missing devices: ${missingDevices.join(', ')}`);
+        
+        // Start scanning only if not already scanning
+        noble.startScanningAsync().catch(err => {
+          this.log.error('Error starting scan:', err);
+        });
+    private deviceDiscovered(peripheral: Peripheral) {
+        const address = peripheral.address.toLowerCase();
+  
+        const cachedPeripheral = this.peripherals.get(address);
+        if (cachedPeripheral && cachedPeripheral.state === 'connected') {
+          // Already connected; no need to update the cache.
+          return;
+        }
+  
+        const now = Date.now();
+        const lastTime = this.lastDiscoveryTime.get(address) || 0;
+        if (now - lastTime < 10000) { // 10-second debounce
+          // Skip logging to reduce log spam
+          return;
+        }
+        
+        this.lastDiscoveryTime.set(address, now);
+        
+        // Update peripheral in cache even if we're not connecting yet
+        this.peripherals.set(address, peripheral);
+        
+        // Only log discovery once per session
+        if (!cachedPeripheral) {
+          this.log.info(`Discovered device: ${address}`);
+        }
+        
+        // Only try to connect if the device is not already connecting
+        if (cachedPeripheral?.state !== 'connecting') {
+          this.connectToDevice(address).catch(err => {
+            this.log.error(`Error in connection process for ${address}:`, err);
+          });
+        }
       }
-    });
-
-    noble.on('discover', (peripheral: Peripheral) => {
+        if (attemptCount > 10) {
+          this.log.warn(`Multiple connection attempts failed. Backing off...`);
+          // Wait longer between retries after multiple failures
+          lastConnectionAttempts.forEach((value, key) => {
+            lastConnectionAttempts.set(key, now);
+          });
+        }
+      } else {
+        attemptCount = 0;
+      }
+    }, scanInterval);
       const address = peripheral.address.toLowerCase();
       if (this.config.devices.some((device: any) => device.address.toLowerCase() === address)) {
         this.deviceDiscovered(peripheral);
