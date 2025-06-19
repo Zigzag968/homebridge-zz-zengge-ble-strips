@@ -17,7 +17,7 @@ const PACKAGE_NAME = 'homebridge-zz-zengge-ble-strips';
 
 let hap: HAP;
 
-module.exports = (homebridge: API) => {
+export = (homebridge: API) => {
   hap = homebridge.hap;
   homebridge.registerPlatform(PLATFORM_NAME, ZenggeLedStripPlatform);
 };
@@ -42,6 +42,7 @@ class BluetoothCommunicator {
   private readonly config: PlatformConfig;
   private readonly devices: Map<string, DeviceState> = new Map();
   private readonly connecting: Set<string> = new Set();
+  private connectionLock = false;
   private isReconnecting: boolean = false;
   private configuredAddresses: string[] = [];
 
@@ -60,37 +61,75 @@ class BluetoothCommunicator {
   // Connect to a device by address, setup characteristic and notifications
   async connectToDevice(address: string): Promise<void> {
     const addr = address.toLowerCase();
-    const state = this.devices.get(addr) || { attempts: 0, lastDiscovery: 0 };
-    if (this.connecting.has(addr)) return;
-    if (!state.peripheral) {
-      this.log.warn(`Peripheral with address ${address} not found.`);
+
+    if (this.connecting.has(addr)) {
+      this.log.debug(`Connection already in progress for ${address}, skipping.`);
       return;
     }
-    if (state.peripheral.state === 'connected') {
-      this.log.debug(`Device ${address} already connected.`);
-      return;
+
+    // Wait for lock to be released to ensure sequential connection
+    while (this.connectionLock) {
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
+
+    this.connectionLock = true;
     this.connecting.add(addr);
+
     try {
+      const state = this.devices.get(addr);
+      if (!state || !state.peripheral) {
+        this.log.warn(`Peripheral with address ${address} not found.`);
+        return; // finally will release lock
+      }
+
+      if (state.peripheral.state === 'connected') {
+        this.log.debug(`Device ${address} already connected.`);
+        return; // finally will release lock
+      }
+
       await this.retryWithBackoff(async () => {
         await state.peripheral!.connectAsync();
       }, BLE_CONNECT_RETRIES, addr);
+
       this.logDevice(addr, 'Connected');
       await new Promise(r => setTimeout(r, 350));
+
       state.characteristic = await this.discoverWriteCharacteristic(state.peripheral!, addr);
+      if (!state.characteristic) {
+        this.log.error(`Failed to discover characteristic for ${addr}, disconnecting.`);
+        await state.peripheral?.disconnectAsync();
+        return; // finally will release lock
+      }
+      
       await new Promise(r => setTimeout(r, 200));
       await this.enableNotification(state.peripheral!, addr);
+
       state.attempts = 0;
-      // Handle disconnect
-      state.peripheral!.removeAllListeners('disconnect');
-      state.peripheral!.once('disconnect', () => this.handleDisconnect(addr));
+      // Using optional chaining for a cleaner, more Swift-like syntax.
+      (state.peripheral as any)?.removeAllListeners('disconnect');
+      state.peripheral?.once('disconnect', (error?: Error) => {
+        if (error) {
+          this.log.warn(`Device ${addr} disconnected unexpectedly: ${error.message}`);
+        }
+        this.handleDisconnect(addr);
+      });
+
       this.devices.set(addr, state);
+
     } catch (e) {
-      state.attempts++;
+      const state = this.devices.get(addr);
+      if (state) {
+        state.attempts++;
+        this.devices.set(addr, state);
+      }
       this.log.error(`Error connecting to ${address}:`, e);
-      this.devices.set(addr, state);
+      const peripheral = this.devices.get(addr)?.peripheral;
+      if (peripheral && (peripheral.state === 'connected' || peripheral.state === 'connecting')) {
+        await peripheral.disconnectAsync().catch((err: Error) => this.log.error(`Error during disconnect after failure: ${err}`));
+      }
     } finally {
       this.connecting.delete(addr);
+      this.connectionLock = false;
     }
   }
 
@@ -150,8 +189,12 @@ class BluetoothCommunicator {
           this.log.debug(`Notification from ${addr}: ${data.toString('hex')}`);
         });
         await new Promise<void>((resolve, reject) => {
-          notifyChar.subscribe((err: any) => {
-            if (err) reject(err); else resolve();
+          notifyChar.subscribe((err?: Error | string | null) => {
+            if (err) {
+              reject(err instanceof Error ? err : new Error(String(err)));
+            } else {
+              resolve();
+            }
           });
         });
         this.logDevice(addr, 'Notifications enabled');
@@ -182,7 +225,7 @@ class BluetoothCommunicator {
     this.devices.set(addr, state);
     this.logDevice(addr, 'Discovered');
     if (peripheral.state !== 'connected' && !this.connecting.has(addr)) {
-      setTimeout(() => this.connectToDevice(addr), 400);
+      this.connectToDevice(addr);
     }
   }
 
@@ -423,7 +466,7 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
     this.log.info(`Host Bluetooth enabled set to: ${this.bluetoothEnabled}`);
 
     if (this.bluetoothEnabled) {
-      exec('sudo /usr/local/bin/enable_bluetooth.sh', (error, stdout, stderr) => {
+      exec('sudo /usr/local/bin/enable_bluetooth.sh', (error: Error | null, stdout: string, stderr: string) => {
         if (error) {
           this.log.error(`Error enabling Bluetooth: ${error.message}`);
           return;
@@ -431,7 +474,7 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
         this.log.info('Bluetooth enable script executed.');
       });
     } else {
-      exec('sudo /usr/local/bin/disable_bluetooth.sh', (error, stdout, stderr) => {
+      exec('sudo /usr/local/bin/disable_bluetooth.sh', (error: Error | null, stdout: string, stderr: string) => {
         if (error) {
           this.log.error(`Error disabling Bluetooth: ${error.message}`);
           return;
@@ -444,7 +487,7 @@ class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
 
   private async getHostBluetoothEnabled(): Promise<CharacteristicValue> {
     return new Promise((resolve, reject) => {
-      exec('rfkill list bluetooth', (error: any, stdout: any, stderr: any) => {
+      exec('rfkill list bluetooth', (error: Error | null, stdout: string, stderr: string) => {
         if (error) {
           this.log.error(`Error checking Bluetooth status: ${error.message}`);
           return reject(error);
@@ -500,7 +543,7 @@ private configureRebootSwitchAccessory(accessory: PlatformAccessory) {
 private async setHostReboot(value: CharacteristicValue) {
   if (value as boolean) {
     this.log.info('Rebooting host...');
-    exec('sudo reboot', (error, stdout, stderr) => {
+    exec('sudo reboot', (error: Error | null, stdout: string, stderr: string) => {
       if (error) {
         this.log.error(`Error rebooting host: ${error.message}`);
         return;
@@ -533,7 +576,7 @@ class ZenggeLedStripPlatformAccessory {
   private accessory: PlatformAccessory;
   private isOn: boolean = false;
   private onService!: Service;
-  private gradientUpdateTimeout: NodeJS.Timeout | null = null;
+  private gradientUpdateTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // Gestion des color stops
   private colorStops: ColorStop[] = [];
@@ -702,7 +745,7 @@ class ZenggeLedStripPlatformAccessory {
       colorService.setCharacteristic(hap.Characteristic.Name, serviceName);
 
       colorService.getCharacteristic(hap.Characteristic.On)
-        .onSet((value) => this.setColorStopOn(i, value))
+        .onSet((value: CharacteristicValue) => this.setColorStopOn(i, value))
         .onGet(() => this.getColorStopOn(i));
 
       if (!colorService.testCharacteristic(hap.Characteristic.Hue)) {
@@ -710,7 +753,7 @@ class ZenggeLedStripPlatformAccessory {
       }
       colorService.getCharacteristic(hap.Characteristic.Hue)
         .setProps({ minValue: 0, maxValue: 360, minStep: 1 })
-        .onSet((value) => this.setColorStopHue(i, value))
+        .onSet((value: CharacteristicValue) => this.setColorStopHue(i, value))
         .onGet(() => this.getColorStopHue(i));
 
       if (!colorService.testCharacteristic(hap.Characteristic.Saturation)) {
@@ -718,7 +761,7 @@ class ZenggeLedStripPlatformAccessory {
       }
       colorService.getCharacteristic(hap.Characteristic.Saturation)
         .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
-        .onSet((value) => this.setColorStopSaturation(i, value))
+        .onSet((value: CharacteristicValue) => this.setColorStopSaturation(i, value))
         .onGet(() => this.getColorStopSaturation(i));
 
       if (!colorService.testCharacteristic(hap.Characteristic.Brightness)) {
@@ -726,7 +769,7 @@ class ZenggeLedStripPlatformAccessory {
       }
       colorService.getCharacteristic(hap.Characteristic.Brightness)
         .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
-        .onSet((value) => this.setColorStopBrightness(i, value))
+        .onSet((value: CharacteristicValue) => this.setColorStopBrightness(i, value))
         .onGet(() => this.getColorStopBrightness(i));
 
       // Initialisation par défaut pour ce stop
