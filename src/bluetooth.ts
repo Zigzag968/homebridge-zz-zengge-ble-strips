@@ -1,6 +1,7 @@
 import { Buffer } from 'buffer';
 import noble, { Peripheral } from '@abandonware/noble';
 import { Logger, PlatformConfig } from 'homebridge';
+import { exec } from 'child_process';
 
 export const BLE_SERVICE_UUID = 'ffff';
 export const BLE_WRITE_UUID = 'ff01';
@@ -266,7 +267,8 @@ export class BluetoothCommunicator {
           state.monitorAttempts++;
           toConnect.push(addr);
         } else {
-          this.log.warn(`Max monitor retries for ${addr}. Forgetting peripheral to force re-discovery.`);
+          this.log.warn(`Max monitor retries for ${addr}. Forcing system-level device removal to clear state.`);
+          this.removeDeviceFromSystem(addr);
           state.peripheral = undefined;
           state.monitorAttempts = 0;
         }
@@ -332,5 +334,20 @@ export class BluetoothCommunicator {
       state.commandQueue.unshift(command);
       this.devices.set(addr, state);
     }
+  }
+  
+  private removeDeviceFromSystem(addr: string) {
+    const command = `bluetoothctl remove ${addr}`;
+    this.log.info(`Executing automatic recovery command: ${command}`);
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        this.log.error(`Error removing device ${addr} from system: ${error.message}`);
+        return;
+      }
+      if (stderr) {
+        this.log.warn(`Stderr while removing device ${addr}: ${stderr}`);
+      }
+      this.log.info(`Successfully removed device ${addr} from system cache. It will be re-discovered.`);
+    });
   }
 }
