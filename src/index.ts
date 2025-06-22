@@ -26,13 +26,15 @@ const BLE_SERVICE_UUID = 'ffff';
 const BLE_WRITE_UUID = 'ff01';
 const BLE_NOTIFY_UUID = 'ff02';
 const BLE_CONNECT_RETRIES = 3;
-const BLE_BACKOFF_BASE = 500; 
+const BLE_BACKOFF_BASE = 500;
 const BLE_MONITOR_INTERVAL = 5000;
 const BLE_DISCOVERY_DEBOUNCE = 10000;
+const BLE_MONITOR_MAX_RETRIES = 3;
 
 interface DeviceState {
   peripheral?: Peripheral;
   attempts: number;
+  monitorAttempts: number;
   lastDiscovery: number;
   characteristic?: any;
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'disconnecting';
@@ -55,6 +57,7 @@ class BluetoothCommunicator {
     for (const addr of this.configuredAddresses) {
       this.devices.set(addr, {
         attempts: 0,
+        monitorAttempts: 0,
         lastDiscovery: 0,
         connectionState: 'disconnected',
         commandQueue: [],
@@ -117,6 +120,7 @@ class BluetoothCommunicator {
       await this.enableNotification(state.peripheral!, addr);
 
       state.attempts = 0;
+      state.monitorAttempts = 0;
       state.connectionState = 'connected';
       // Using optional chaining for a cleaner, more Swift-like syntax.
       (state.peripheral as any)?.removeAllListeners('disconnect');
@@ -171,6 +175,7 @@ class BluetoothCommunicator {
       state.characteristic = undefined;
       state.connectionState = 'disconnected';
       state.attempts = 0;
+      state.monitorAttempts = 0;
       this.devices.set(addr, state);
     }
   }
@@ -259,26 +264,37 @@ class BluetoothCommunicator {
 
   // Monitor and reconnect to any lost devices
   private async monitorConnections() {
-    if (this.isReconnecting) return;
+    if (this.isReconnecting) {
+      return;
+    }
     const toConnect: string[] = [];
     for (const addr of this.configuredAddresses) {
       const state = this.devices.get(addr);
-      if (!state?.peripheral) continue;
-      if (this.connecting.has(addr)) continue;
-      if (state.peripheral.state !== 'connected') {
-        if (state.attempts < BLE_CONNECT_RETRIES) {
+      if (!state || this.connecting.has(addr)) {
+        continue;
+      }
+      if (state.connectionState === 'disconnected') {
+        if (!state.peripheral) {
+          if (state.monitorAttempts > 5) {
+            this.log.debug(`Still waiting for device ${addr} to be discovered...`);
+          }
+          state.monitorAttempts++;
+          continue;
+        }
+        if (state.monitorAttempts < BLE_MONITOR_MAX_RETRIES) {
+          this.log.debug(`Device ${addr} is disconnected, scheduling reconnect (Attempt ${state.monitorAttempts + 1})`);
+          state.monitorAttempts++;
           toConnect.push(addr);
         } else {
-          this.log.error(`Max retries reached for ${addr}, skipping reconnect`);
+          this.log.warn(`Max monitor retries for ${addr}. Forgetting peripheral to force re-discovery.`);
+          state.peripheral = undefined;
+          state.monitorAttempts = 0;
         }
       }
     }
-    if (toConnect.length) {
+    if (toConnect.length > 0) {
       this.isReconnecting = true;
       try {
-        noble.stopScanning();
-        await new Promise(r => setTimeout(r, 1200));
-        noble.startScanning([], false);
         for (const addr of toConnect) {
           await this.connectToDevice(addr);
         }
