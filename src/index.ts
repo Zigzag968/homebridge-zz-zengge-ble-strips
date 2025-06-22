@@ -35,6 +35,8 @@ interface DeviceState {
   attempts: number;
   lastDiscovery: number;
   characteristic?: any;
+  connectionState: 'disconnected' | 'connecting' | 'connected' | 'disconnecting';
+  commandQueue: Buffer[];
 }
 
 class BluetoothCommunicator {
@@ -50,6 +52,14 @@ class BluetoothCommunicator {
     this.log = log;
     this.config = config;
     this.configuredAddresses = (config.devices || []).map((d: any) => d.address.toLowerCase());
+    for (const addr of this.configuredAddresses) {
+      this.devices.set(addr, {
+        attempts: 0,
+        lastDiscovery: 0,
+        connectionState: 'disconnected',
+        commandQueue: [],
+      });
+    }
     this.setupNoble();
   }
 
@@ -81,9 +91,11 @@ class BluetoothCommunicator {
         this.log.warn(`Peripheral with address ${address} not found.`);
         return; // finally will release lock
       }
+      state.connectionState = 'connecting';
 
       if (state.peripheral.state === 'connected') {
         this.log.debug(`Device ${address} already connected.`);
+        state.connectionState = 'connected';
         return; // finally will release lock
       }
 
@@ -105,6 +117,7 @@ class BluetoothCommunicator {
       await this.enableNotification(state.peripheral!, addr);
 
       state.attempts = 0;
+      state.connectionState = 'connected';
       // Using optional chaining for a cleaner, more Swift-like syntax.
       (state.peripheral as any)?.removeAllListeners('disconnect');
       state.peripheral?.once('disconnect', (error?: Error) => {
@@ -115,6 +128,7 @@ class BluetoothCommunicator {
       });
 
       this.devices.set(addr, state);
+      this.processCommandQueue(addr);
 
     } catch (e) {
       const state = this.devices.get(addr);
@@ -155,6 +169,7 @@ class BluetoothCommunicator {
     if (state) {
       this.logDevice(addr, 'Disconnected');
       state.characteristic = undefined;
+      state.connectionState = 'disconnected';
       state.attempts = 0;
       this.devices.set(addr, state);
     }
@@ -217,14 +232,14 @@ class BluetoothCommunicator {
     // Only process configured devices
     if (!this.configuredAddresses.includes(addr)) return;
     const now = Date.now();
-    const state = this.devices.get(addr) || { attempts: 0, lastDiscovery: 0 };
+    const state = this.devices.get(addr)!;
     // Debounce discoveries
     if (now - state.lastDiscovery < BLE_DISCOVERY_DEBOUNCE) return;
     state.peripheral = peripheral;
     state.lastDiscovery = now;
     this.devices.set(addr, state);
     this.logDevice(addr, 'Discovered');
-    if (peripheral.state !== 'connected' && !this.connecting.has(addr)) {
+    if (state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
       this.connectToDevice(addr);
     }
   }
@@ -277,28 +292,49 @@ class BluetoothCommunicator {
   public async sendCommand(address: string, command: Buffer): Promise<void> {
     const addr = address.toLowerCase();
     const state = this.devices.get(addr);
-    if (!state || !state.characteristic) {
-      this.log.warn(`No characteristic for ${address}, attempting reconnect...`);
-      await this.connectToDevice(address);
-      const updated = this.devices.get(addr);
-      if (!updated?.characteristic) {
-        this.log.error(`No characteristic for ${address} after reconnect`);
-        return;
-      }
-      try {
-        await updated.characteristic.write(command, true);
-        this.log.info(`Command sent to ${address} after reconnect`);
-      } catch (e) {
-        this.log.error(`Failed to send command to ${address}:`, e);
-      }
+
+    if (!state) {
+      this.log.error(`Device ${address} not configured.`);
       return;
     }
-    try {
-      await state.characteristic.write(command, true);
-      this.log.debug(`Command sent to ${address}`);
-    } catch (e) {
-      this.log.error(`Failed to send command to ${address}:`, e);
+
+    // Queue only the latest command.
+    state.commandQueue = [command];
+    this.devices.set(addr, state);
+
+    if (state.connectionState === 'connected' && state.characteristic) {
+      await this.processCommandQueue(addr);
+    } else if (state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
+      this.log.warn(`Device ${address} is disconnected. Queuing command and attempting to connect.`);
       await this.connectToDevice(address);
+    } else {
+      this.log.debug(`Device ${address} is busy (${state.connectionState}). Command queued.`);
+    }
+  }
+
+  private async processCommandQueue(addr: string): Promise<void> {
+    const state = this.devices.get(addr);
+    if (!state || state.commandQueue.length === 0 || state.connectionState !== 'connected' || !state.characteristic) {
+      return;
+    }
+
+    const command = state.commandQueue.shift(); // Get the latest command
+    if (!command) {
+      return;
+    }
+
+    try {
+      this.log.debug(`Sending command to ${addr}: ${command.toString('hex')}`);
+      await state.characteristic.write(command, true);
+      this.log.debug(`Command sent to ${addr}`);
+      // Clear queue after successful send.
+      state.commandQueue = [];
+      this.devices.set(addr, state);
+    } catch (e) {
+      this.log.error(`Failed to write command to ${addr}:`, e);
+      // Re-queue the failed command. The disconnect handler will manage reconnection.
+      state.commandQueue.unshift(command);
+      this.devices.set(addr, state);
     }
   }
 }
