@@ -6,5 +6,4 @@ export const PLATFORM_NAME = 'HomebridgeZzZenggeBleStrips';
 /**
  * This must match the name of your plugin as defined the package.json
  */
-export const PLUGIN_NAME = 'homebridge-zz-zengge-ble-strips';
-
+export const PACKAGE_NAME = 'homebridge-zz-zengge-ble-strips';
