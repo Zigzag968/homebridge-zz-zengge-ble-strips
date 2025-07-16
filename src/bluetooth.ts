@@ -120,8 +120,17 @@ export class BluetoothCommunicator {
       const state = this.devices.get(addr);
       if (state) {
         state.attempts++;
-        if (state.peripheral && (state.peripheral.state === 'connected' || state.peripheral.state === 'connecting')) {
-          await state.peripheral.disconnectAsync().catch((err: Error) => this.log.error(`Error during disconnect after failure: ${err}`));
+        const oldPeripheral = state.peripheral; // Garder une référence temporaire
+        
+        // Invalider l'état actuel
+        state.peripheral = undefined;
+        state.connectionState = 'disconnected';
+        this.devices.set(addr, state);
+        this.startBluetoothScanning(); // S'assurer que le scan est actif
+
+        // Tenter une déconnexion propre de l'ancien objet
+        if (oldPeripheral && (oldPeripheral.state === 'connected' || oldPeripheral.state === 'connecting')) {
+          await oldPeripheral.disconnectAsync().catch((err: Error) => this.log.error(`Error during disconnect after failure: ${err}`));
         }
       }
     } finally {
@@ -150,7 +159,9 @@ export class BluetoothCommunicator {
       this.logDevice(addr, 'Disconnected.');
       state.characteristic = undefined;
       state.connectionState = 'disconnected';
+      state.peripheral = undefined;
       this.devices.set(addr, state);
+      this.startBluetoothScanning();
     }
   }
 
