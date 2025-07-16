@@ -253,34 +253,42 @@ export class BluetoothCommunicator {
     const state = this.devices.get(addr);
 
     if (!state) {
+      this.log.warn(`[BLE][${addr}] Cannot send command: device not found.`);
       return;
     }
 
+    this.log.debug(`[BLE][${addr}] Adding command to queue: ${command.toString('hex')}`);
     state.commandQueue = [command];
     this.devices.set(addr, state);
 
     if (state.connectionState === 'connected' && state.characteristic) {
+      this.log.debug(`[BLE][${addr}] Device is connected. Processing command queue.`);
       await this.processCommandQueue(addr);
     } else if (state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
+      this.log.info(`[BLE][${addr}] Device is disconnected. Initiating connection.`);
       this.connectToDevice(address);
-    }
+    } 
   }
 
   private async processCommandQueue(addr: string): Promise<void> {
     const state = this.devices.get(addr);
     if (!state || state.commandQueue.length === 0 || state.connectionState !== 'connected' || !state.characteristic) {
+      this.log.debug(`[BLE][${addr}] Command queue processing skipped: invalid state or empty queue.`);
       return;
     }
     const command = state.commandQueue.shift();
     if (!command) {
+      this.log.debug(`[BLE][${addr}] Command queue processing skipped: no command to process.`);
       return;
     }
     try {
-      await state.characteristic.write(command, true);
+      this.log.debug(`[BLE][${addr}] Writing command to characteristic: ${command.toString('hex')}`);
+      await state.characteristic.write(command, false);
+      this.log.info(`[BLE][${addr}] Command successfully written.`);
       state.commandQueue = [];
       this.devices.set(addr, state);
     } catch (e) {
-      this.log.error(`Failed to write command to ${addr}:`, e);
+      this.log.error(`[BLE][${addr}] Failed to write command:`, e);
       state.commandQueue.unshift(command);
       this.devices.set(addr, state);
     }
