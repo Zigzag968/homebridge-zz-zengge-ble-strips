@@ -12,6 +12,8 @@ export const BLE_MONITOR_INTERVAL = 5000;
 export const BLE_DISCOVERY_DEBOUNCE = 10000;
 export const BLE_MAX_CONNECTION_ATTEMPTS = 5;
 export const BLE_COOL_DOWN_PERIOD = 5 * 60 * 1000; // 5 minutes
+export const BLE_PING_TIMEOUT = 3000; // 3 seconds for ping verification
+export const BLE_PING_COMMAND = Buffer.from([0xFF, 0x00, 0x01]); // Ping command that expects response
 
 export interface DeviceState {
   peripheral?: Peripheral;
@@ -19,8 +21,14 @@ export interface DeviceState {
   lastDiscovery: number;
   lastAttempt: number;
   characteristic?: any;
+  notifyCharacteristic?: any;
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'disconnecting';
   commandQueue: Buffer[];
+  pendingPing?: {
+    resolve: (value: boolean) => void;
+    reject: (reason?: any) => void;
+    timeout: NodeJS.Timeout;
+  };
 }
 
 export class BluetoothCommunicator {
@@ -157,7 +165,21 @@ export class BluetoothCommunicator {
     const state = this.devices.get(addr);
     if (state) {
       this.logDevice(addr, 'Disconnected.');
+      
+      // Log détaillé pour diagnostiquer les déconnexions
+      if (state.commandQueue.length > 0) {
+        this.log.warn(`[BLE][${addr}] Disconnected with ${state.commandQueue.length} pending commands`);
+      }
+      
+      // Nettoyer les ping en cours
+      if (state.pendingPing) {
+        clearTimeout(state.pendingPing.timeout);
+        state.pendingPing.reject(new Error('Device disconnected'));
+        state.pendingPing = undefined;
+      }
+      
       state.characteristic = undefined;
+      state.notifyCharacteristic = undefined;
       state.connectionState = 'disconnected';
       state.peripheral = undefined;
       this.devices.set(addr, state);
@@ -186,8 +208,14 @@ export class BluetoothCommunicator {
       );
       if (characteristics.length > 0) {
         const notifyChar = characteristics[0];
+        const state = this.devices.get(addr);
+        if (state) {
+          state.notifyCharacteristic = notifyChar;
+          this.devices.set(addr, state);
+        }
+        
         notifyChar.on('data', (data: Buffer) => {
-          this.log.debug(`Notification from ${addr}: ${data.toString('hex')}`);
+          this.handleNotificationData(addr, data);
         });
         await notifyChar.subscribeAsync();
         this.logDevice(addr, 'Notifications enabled');
@@ -197,8 +225,116 @@ export class BluetoothCommunicator {
     }
   }
 
+  /**
+   * Handle incoming notification data from the device
+   */
+  private handleNotificationData(addr: string, data: Buffer): void {
+    this.log.debug(`Notification from ${addr}: ${data.toString('hex')}`);
+    
+    const state = this.devices.get(addr);
+    if (!state) return;
+
+    // Check if this is a ping response (assuming ping response is [0xFF, 0x00, 0x02])
+    if (state.pendingPing && data.length >= 3 &&
+        data[0] === 0xFF && data[1] === 0x00 && data[2] === 0x02) {
+      
+      clearTimeout(state.pendingPing.timeout);
+      state.pendingPing.resolve(true);
+      state.pendingPing = undefined;
+      this.devices.set(addr, state);
+      this.log.debug(`[BLE][${addr}] Ping response received`);
+    }
+  }
+
   private logDevice(addr: string, msg: string) {
     this.log.info(`[BLE][${addr}] ${msg}`);
+  }
+
+  /**
+   * Vérifie si le périphérique est réellement connecté en validant tous les états
+   */
+  private isDeviceReallyConnected(state: DeviceState): boolean {
+    return (
+      state.connectionState === 'connected' &&
+      state.peripheral &&
+      state.peripheral.state === 'connected' &&
+      state.characteristic
+    );
+  }
+
+  /**
+   * Vérifie la connexion en envoyant une commande ping et en attendant la réponse
+   * Utilise les notifications pour confirmer que le device répond réellement
+   */
+  private async verifyConnection(addr: string): Promise<boolean> {
+    const state = this.devices.get(addr);
+    if (!state || !this.isDeviceReallyConnected(state)) {
+      return false;
+    }
+
+    // Si pas de caractéristique de notification, fallback sur l'ancienne méthode
+    if (!state.notifyCharacteristic) {
+      this.log.debug(`[BLE][${addr}] No notification characteristic, using basic write test`);
+      return this.basicConnectionTest(addr, state);
+    }
+
+    // Si un ping est déjà en cours, attendre qu'il se termine
+    if (state.pendingPing) {
+      this.log.debug(`[BLE][${addr}] Ping already in progress, skipping verification`);
+      return true;
+    }
+
+    return new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (state.pendingPing) {
+          state.pendingPing = undefined;
+          this.devices.set(addr, state);
+        }
+        this.log.warn(`[BLE][${addr}] Ping timeout - connection verification failed`);
+        resolve(false);
+      }, BLE_PING_TIMEOUT);
+
+      state.pendingPing = {
+        resolve: (success: boolean) => {
+          clearTimeout(timeout);
+          resolve(success);
+        },
+        reject: (error: any) => {
+          clearTimeout(timeout);
+          this.log.warn(`[BLE][${addr}] Ping error:`, error);
+          resolve(false);
+        },
+        timeout
+      };
+
+      this.devices.set(addr, state);
+
+      // Envoyer la commande ping avec réponse attendue
+      state.characteristic.write(BLE_PING_COMMAND, true).then(() => {
+        this.log.debug(`[BLE][${addr}] Ping command sent, waiting for response...`);
+      }).catch((error: any) => {
+        if (state.pendingPing) {
+          state.pendingPing.reject(error);
+          state.pendingPing = undefined;
+          this.devices.set(addr, state);
+        }
+      });
+    });
+  }
+
+  /**
+   * Test de connexion basique pour les devices sans notification
+   */
+  private async basicConnectionTest(addr: string, state: DeviceState): Promise<boolean> {
+    try {
+      // Utiliser une commande avec réponse pour avoir une confirmation
+      await state.characteristic.write(BLE_PING_COMMAND, true);
+      this.log.debug(`[BLE][${addr}] Basic connection test successful`);
+      return true;
+    } catch (e) {
+      this.log.warn(`[BLE][${addr}] Basic connection test failed:`, e);
+      return false;
+    }
   }
 
   private deviceDiscovered(peripheral: Peripheral) {
@@ -232,7 +368,19 @@ export class BluetoothCommunicator {
 
     for (const addr of this.configuredAddresses) {
       const state = this.devices.get(addr);
-      if (state && state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
+      if (!state) continue;
+
+      // Vérifier les connexions supposées actives
+      if (state.connectionState === 'connected') {
+        const isReallyConnected = await this.verifyConnection(addr);
+        if (!isReallyConnected) {
+          this.log.warn(`[BLE][${addr}] Silent disconnection detected during monitoring. Forcing reconnection.`);
+          this.handleDisconnect(addr);
+        }
+      }
+
+      // Logique de reconnexion pour les périphériques déconnectés
+      if (state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
         if (state.attempts >= BLE_MAX_CONNECTION_ATTEMPTS) {
           const timeSinceLastAttempt = Date.now() - state.lastAttempt;
           if (timeSinceLastAttempt < BLE_COOL_DOWN_PERIOD) {
@@ -261,26 +409,46 @@ export class BluetoothCommunicator {
     state.commandQueue = [command];
     this.devices.set(addr, state);
 
-    if (state.connectionState === 'connected' && state.characteristic) {
+    // Validation complète de l'état de connexion
+    const isReallyConnected = this.isDeviceReallyConnected(state);
+    
+    if (isReallyConnected) {
       this.log.debug(`[BLE][${addr}] Device is connected. Processing command queue.`);
       await this.processCommandQueue(addr);
-    } else if (state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
-      this.log.info(`[BLE][${addr}] Device is disconnected. Initiating connection.`);
-      this.connectToDevice(address);
-    } 
+    } else {
+      this.log.info(`[BLE][${addr}] Device connection invalid. Initiating reconnection.`);
+      // Forcer la réinitialisation de l'état si nécessaire
+      if (state.connectionState === 'connected') {
+        this.log.warn(`[BLE][${addr}] State desync detected. Forcing disconnect.`);
+        this.handleDisconnect(addr);
+      }
+      
+      if (!this.connecting.has(addr)) {
+        this.connectToDevice(address);
+      }
+    }
   }
 
   private async processCommandQueue(addr: string): Promise<void> {
     const state = this.devices.get(addr);
-    if (!state || state.commandQueue.length === 0 || state.connectionState !== 'connected' || !state.characteristic) {
+    if (!state || state.commandQueue.length === 0) {
       this.log.debug(`[BLE][${addr}] Command queue processing skipped: invalid state or empty queue.`);
       return;
     }
-    const command = state.commandQueue.shift();
-    if (!command) {
-      this.log.debug(`[BLE][${addr}] Command queue processing skipped: no command to process.`);
+
+    // Validation complète avant traitement
+    if (!this.isDeviceReallyConnected(state)) {
+      this.log.warn(`[BLE][${addr}] Device not really connected. Forcing reconnection.`);
+      this.handleDisconnect(addr);
+      this.connectToDevice(addr);
       return;
     }
+
+    const command = state.commandQueue.shift();
+    if (!command) {
+      return;
+    }
+
     try {
       this.log.debug(`[BLE][${addr}] Writing command to characteristic: ${command.toString('hex')}`);
       await state.characteristic.write(command, false);
@@ -289,8 +457,12 @@ export class BluetoothCommunicator {
       this.devices.set(addr, state);
     } catch (e) {
       this.log.error(`[BLE][${addr}] Failed to write command:`, e);
-      state.commandQueue.unshift(command);
+      // En cas d'erreur d'écriture, forcer la reconnexion
+      this.log.warn(`[BLE][${addr}] Write error detected. Forcing reconnection.`);
+      this.handleDisconnect(addr);
+      state.commandQueue.unshift(command); // Remettre la commande en queue
       this.devices.set(addr, state);
+      this.connectToDevice(addr);
     }
   }
 }
