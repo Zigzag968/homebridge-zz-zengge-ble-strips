@@ -4,7 +4,6 @@ import {
   Service,
   CharacteristicValue,
 } from 'homebridge';
-import { BluetoothCommunicator } from './bluetooth';
 import { ZenggeLedStripPlatform } from './platform';
 import { PLATFORM_NAME } from './settings';
 import { hsvToHex, hexToHsv, interpolateHue } from './utils';
@@ -28,7 +27,6 @@ interface ColorStop {
 export class ZenggeLedStripPlatformAccessory {
   private readonly logger: Logger;
   private readonly name: string;
-  private bluetoothCommunicator: BluetoothCommunicator;
   readonly deviceAddress: string;
   private accessory: PlatformAccessory;
   private platform: ZenggeLedStripPlatform;
@@ -52,13 +50,11 @@ export class ZenggeLedStripPlatformAccessory {
 
   constructor(
     platform: ZenggeLedStripPlatform,
-    bluetoothCommunicator: BluetoothCommunicator,
     logger: Logger,
     config: DeviceConfig,
     accessory: PlatformAccessory
   ) {
     this.platform = platform;
-    this.bluetoothCommunicator = bluetoothCommunicator;
     this.logger = logger;
     this.name = config.name || 'Zengge LED Strip';
     this.deviceAddress = config.address;
@@ -257,7 +253,9 @@ export class ZenggeLedStripPlatformAccessory {
   }
 
   async sendCommand(command: Buffer) {
-    return this.bluetoothCommunicator.sendCommand(this.deviceAddress, this.preparePacket(command));
+    // Use platform.ble.sendCommand, converting buffer to hex
+    const prepared = this.preparePacket(command);
+    this.platform.ble.sendCommand(this.deviceAddress, prepared.toString('hex'));
   }
 
   async setPower(value: boolean) {

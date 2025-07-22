@@ -8,8 +8,11 @@ import {
   HAP,
 } from 'homebridge';
 import { exec } from 'child_process';
+import { spawn } from 'child_process';
+import * as path from 'path';
+import * as fs from 'fs';
 import { PACKAGE_NAME, PLATFORM_NAME } from './settings';
-import { BluetoothCommunicator } from './bluetooth';
+import { BleBridge } from './bleBridge';
 import { ZenggeLedStripPlatformAccessory, DeviceConfig } from './accessory';
 
 export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
@@ -17,7 +20,7 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
   private readonly config: PlatformConfig;
   private readonly accessories: PlatformAccessory[] = [];
   public readonly hap: HAP;
-  private readonly bluetoothCommunicator: BluetoothCommunicator;
+  public readonly ble: BleBridge;
   private bluetoothSwitchAccessory: PlatformAccessory | null = null;
   private bluetoothEnabled: boolean = true;
 
@@ -25,11 +28,26 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
     this.log = log;
     this.config = config;
     this.hap = homebridge.hap;
-    this.bluetoothCommunicator = new BluetoothCommunicator(log, config);
+    this.ble = new BleBridge();
 
     homebridge.on('didFinishLaunching', () => {
+      this.launchPythonDispatcher();
       this.initializePlatform();
     });
+  }
+
+  private launchPythonDispatcher() {
+    const pythonPath = path.resolve(__dirname, '..', 'ble-venv', 'bin', 'python3');
+    const scriptPath = path.resolve(__dirname, '..', 'scripts', 'bleDispatcher.py');
+    if (!fs.existsSync(pythonPath)) {
+      this.log.error(`[BLEAK] Python virtual environment not found at ${pythonPath}. Please reinstall the plugin.`);
+      return;
+    }
+    const child = spawn(pythonPath, [scriptPath], {
+      stdio: 'inherit',
+      detached: true
+    });
+    child.unref();
   }
 
   private initializePlatform() {
@@ -38,6 +56,16 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
       return;
     }
     this.log.info('ZenggeLedStrip platform initializing...');
+
+    this.ble.start(this.config.devices.map((device: any) => device.address.toUpperCase()));
+
+    // Register each device in the BLE daemon by sending a dummy command
+    this.config.devices.forEach((deviceConfig: any) => {
+      const address = deviceConfig.address?.toUpperCase();
+      if (address) {
+        this.ble.sendCommand(address, '00'); // Inform daemon to track this device
+      }
+    });
 
     this.config.devices.forEach((deviceConfig: any) => {
       const address = deviceConfig.address;
@@ -61,7 +89,7 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
         accessory.context.deviceConfig = deviceConfig;
         deviceConfig.trames = (this.config.trames || []).concat(deviceConfig.trames || []);
 
-        const controller = new ZenggeLedStripPlatformAccessory(this, this.bluetoothCommunicator, this.log, deviceConfig, accessory);
+        const controller = new ZenggeLedStripPlatformAccessory(this, this.log, deviceConfig, accessory);
         accessory.context.controller = controller;
         controller.configure(accessory);
 
@@ -74,7 +102,7 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
         this.accessories.push(accessory);
       } else {
         this.log.info(`Accessory ${accessory.displayName} is cached.`);
-        const controller = new ZenggeLedStripPlatformAccessory(this, this.bluetoothCommunicator, this.log, deviceConfig, accessory);
+        const controller = new ZenggeLedStripPlatformAccessory(this, this.log, deviceConfig, accessory);
         accessory.context.controller = controller;
         controller.configure(accessory);
         this.accessories.push(accessory);
@@ -114,7 +142,7 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
 
     deviceConfig.trames = (this.config.trames || []).concat(deviceConfig.trames || []);
 
-    const controller = new ZenggeLedStripPlatformAccessory(this, this.bluetoothCommunicator, this.log, deviceConfig, accessory);
+    const controller = new ZenggeLedStripPlatformAccessory(this, this.log, deviceConfig, accessory);
     accessory.context.controller = controller;
     controller.configure(accessory);
     this.accessories.push(accessory);

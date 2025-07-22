@@ -27,9 +27,9 @@
     "tslint": "^5.20.0"
     },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp scripts/bleDispatcher.py dist/",
     "watch": "nodemon",
     "prepublishOnly": "npm i --package-lock-only && npm audit && npm run build",
-    "postinstall": "npm run build"
+    "postinstall": "npm run build && node scripts/postInstall.js"
   }
 }
