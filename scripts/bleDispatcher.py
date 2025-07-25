@@ -129,10 +129,8 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
     Returns:
         bool: True si l'écriture a réussi, False sinon
     """
-    print(f"DEBUG: write_ble_command called for {mac} with command {command}", file=sys.stderr, flush=True)
     
     if mac not in connected_clients:
-        print(f"Device {mac} not in connected_clients", file=sys.stderr, flush=True)
         if send_feedback:
             error_msg = {"device": mac, "status": "error", "command": command, "error": "Device not connected"}
             print(json.dumps(error_msg), flush=True)
@@ -140,10 +138,7 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
     
     client = connected_clients[mac]["client"]
     write_char = connected_clients[mac]["write_char"]
-    
-    print(f"DEBUG: Client found for {mac}, is_connected: {client.is_connected if client else 'None'}", file=sys.stderr, flush=True)
-    print(f"DEBUG: Write characteristic: {write_char}", file=sys.stderr, flush=True)
-    
+ 
     if not write_char:
         print(f"No write characteristic for {mac}", file=sys.stderr, flush=True)
         if send_feedback:
@@ -153,7 +148,6 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
     
     try:
         # Validation complète de la connexion avec timeout
-        print(f"DEBUG: Validating connection for {mac}", file=sys.stderr, flush=True)
         if not await validate_connection(mac):
             print(f"Connection validation failed for {mac}", file=sys.stderr, flush=True)
             # Nettoyer la connexion défaillante
@@ -164,16 +158,12 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
                 print(json.dumps(error_msg), flush=True)
             return False
         
-        print(f"DEBUG: About to write to {mac}", file=sys.stderr, flush=True)
-        print(f"Sending command to {mac}: {command}", file=sys.stderr, flush=True)
-        
         # Écriture avec timeout pour éviter les blocages
         await asyncio.wait_for(
             client.write_gatt_char(write_char, bytes.fromhex(command)),
             timeout=5.0
         )
         
-        print(f"DEBUG: Write completed successfully for {mac}", file=sys.stderr, flush=True)
         print(f"Command sent successfully to {mac}", file=sys.stderr, flush=True)
         
         if send_feedback:
@@ -183,7 +173,6 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
         return True
         
     except asyncio.TimeoutError:
-        print(f"DEBUG: Write timeout for {mac}", file=sys.stderr, flush=True)
         print(f"Write timeout for {mac}, connection may be stale", file=sys.stderr, flush=True)
         # Nettoyer la connexion en timeout
         await force_disconnect_device(mac, client)
@@ -196,7 +185,6 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
         return False
         
     except Exception as e:
-        print(f"DEBUG: Write failed for {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         print(f"Failed to send command to {mac}: {e}", file=sys.stderr, flush=True)
         # Nettoyer la connexion défaillante
         await force_disconnect_device(mac, client)
@@ -338,7 +326,6 @@ async def connect_on_demand(mac: str):
         
     except Exception as e:
         print(f"Direct connection failed for {mac}: {e}", file=sys.stderr, flush=True)
-        print(f"Trying scan-then-connect for {mac}...", file=sys.stderr, flush=True)
         
         # Si échec, faire un scan puis réessayer
         if await scan_for_device(mac):

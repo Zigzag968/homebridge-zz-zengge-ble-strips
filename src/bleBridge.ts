@@ -390,7 +390,7 @@ private async waitForConnectionConfirmation(addr: string): Promise<void> {
                 this.log.info(`[BLE PYTHON SUCCESS] Command sent to ${message.device}: ${message.command}`);
                 this.handleCommandSuccess(deviceAddr, message.command);
               } else if (message.status === 'error') {
-                this.log.error(`[BLE PYTHON ERROR] Failed to send command to ${message.device}: ${message.error}`);
+                this.log.error(`[BLE PYTHON ERR] Failed to send command to ${message.device}: ${message.error}`);
                 this.handleCommandError(deviceAddr, message.command, message.error);
               } else if (message.status === 'queued') {
                 this.log.warn(`[BLE PYTHON QUEUED] Command queued for ${message.device}: ${message.command}`);
