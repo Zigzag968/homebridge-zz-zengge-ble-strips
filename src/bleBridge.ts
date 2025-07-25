@@ -20,6 +20,12 @@ export const BLE_MAX_CONNECTION_ATTEMPTS = 5;
 export const BLE_COOL_DOWN_PERIOD = 5 * 60 * 1000; // 5 minutes
 export const BLE_COMMAND_TIMEOUT = 10000; // 10 seconds
 
+// Proactive connection constants
+export const BLE_PROACTIVE_CONNECTION = true;
+export const BLE_CONNECTION_HEALTH_CHECK = true;
+export const BLE_KEEP_ALIVE_INTERVAL = 60000; // 1 minute
+export const BLE_MAX_RECONNECT_ATTEMPTS = 5;
+
 type PendingRequest = {
   device: string;
   command: string;
@@ -80,8 +86,31 @@ export class BleBridge {
   /**
    * Initialize the bridge and start monitoring
    */
-  private initialize(): void {
+  private async initialize(): Promise<void> {
     this.startMonitoring();
+    
+    // Connexion proactive de tous les devices configurés si activée
+    if (BLE_PROACTIVE_CONNECTION) {
+      await this.connectAllConfiguredDevices();
+    }
+  }
+
+  /**
+   * Connect proactively to all configured devices
+   */
+  private async connectAllConfiguredDevices(): Promise<void> {
+    this.log.info('[BLE Bridge] Initiating proactive connections to all configured devices');
+    
+    const connectionPromises = this.configuredAddresses.map(async (addr) => {
+      try {
+        await this.connectToDevice(addr);
+      } catch (error) {
+        this.log.warn(`[BLE Bridge][${addr}] Initial connection failed, will retry later:`, error);
+      }
+    });
+    
+    await Promise.allSettled(connectionPromises);
+    this.log.info('[BLE Bridge] Proactive connection attempts completed');
   }
 
   private startMonitoring(): void {
@@ -108,10 +137,10 @@ export class BleBridge {
         const state = this.devices.get(addr);
         if (!state) continue;
 
-        // Check for devices that need reconnection
+        // Reconnexion proactive pour devices déconnectés
         if (state.connectionState === 'disconnected' && !this.connecting.has(addr)) {
-          // Check if we're in cool-down period
-          if (state.retryCount >= BLE_MAX_CONNECTION_ATTEMPTS) {
+          // Vérifier la période de cool-down
+          if (state.retryCount >= BLE_MAX_RECONNECT_ATTEMPTS) {
             const timeSinceLastAttempt = Date.now() - state.lastAttempt;
             if (timeSinceLastAttempt < BLE_COOL_DOWN_PERIOD) {
               continue; // Still in cool-down
@@ -122,21 +151,38 @@ export class BleBridge {
             }
           }
 
-          // Attempt reconnection if there are queued commands
-          if (state.commandQueue.length > 0) {
-            this.log.debug(`[BLE Bridge][${addr}] Initiating reconnection for queued commands`);
+          // Reconnexion proactive (pas seulement si commandes en queue)
+          if (BLE_PROACTIVE_CONNECTION) {
+            this.log.debug(`[BLE Bridge][${addr}] Proactive reconnection attempt`);
             await this.connectToDevice(addr);
+          } else {
+            // Comportement original : reconnexion seulement si commandes en queue
+            if (state.commandQueue.length > 0) {
+              this.log.debug(`[BLE Bridge][${addr}] Initiating reconnection for queued commands`);
+              await this.connectToDevice(addr);
+            }
           }
         }
 
-        // Update last activity for connected devices
+        // Health check pour connexions établies
+        if (state.connectionState === 'connected' && BLE_CONNECTION_HEALTH_CHECK) {
+          const timeSinceActivity = Date.now() - state.lastActivity;
+          if (timeSinceActivity > BLE_KEEP_ALIVE_INTERVAL) {
+            this.log.debug(`[BLE Bridge][${addr}] Connection inactive for ${Math.round(timeSinceActivity/1000)}s, checking health`);
+            // Optionnel : envoyer une commande de ping ou vérifier l'état
+            // Pour l'instant, on met juste à jour lastActivity
+            state.lastActivity = Date.now();
+            this.devices.set(addr, state);
+          }
+        }
+
+        // Update last activity for connected devices (comportement original)
         if (state.connectionState === 'connected') {
-          state.lastActivity = Date.now();
           this.devices.set(addr, state);
         }
       }
     } catch (error) {
-      this.log.error('[BLE Bridge] Error during connection monitoring:', error);
+      this.log.error('[BLE Bridge] Error during proactive monitoring:', error);
     } finally {
       this.monitorInProgress = false;
     }
@@ -401,11 +447,11 @@ private async waitForConnectionConfirmation(addr: string): Promise<void> {
       }
     });
 
-    setTimeout(() => {
+    setTimeout(async () => {
       if (this.pythonProcess && this.pythonProcess.pid) {
         this.log.info(`[BLE] Python process started successfully with PID: ${this.pythonProcess.pid}`);
         this.ready = true;
-        this.initialize(); // Start monitoring
+        await this.initialize(); // Start monitoring and proactive connections
       } else {
         this.log.error('[BLE] Python process failed to start within timeout');
         this.ready = false;
@@ -514,6 +560,7 @@ private async waitForConnectionConfirmation(addr: string): Promise<void> {
 
   /**
    * New sendCommand method compatible with bluetooth.ts interface (Buffer support)
+   * Optimized for proactive connections to eliminate latency
    */
   async sendCommandBuffer(address: string, command: Buffer): Promise<void> {
     const addr = address.toLowerCase();
@@ -530,19 +577,27 @@ private async waitForConnectionConfirmation(addr: string): Promise<void> {
     }
 
     const commandHex = command.toString('hex');
-    this.log.debug(`[BLE Bridge][${addr}] Queuing command: ${commandHex}`);
+    this.log.debug(`[BLE Bridge][${addr}] Sending command: ${commandHex}`);
 
-    // Replace any existing command in queue (same behavior as original)
+    // Mise en queue de la commande
     state.commandQueue = [command];
     state.lastActivity = Date.now();
     this.devices.set(addr, state);
 
     if (state.connectionState === 'connected') {
+      // Envoi immédiat si connecté - pas de latence
       await this.processCommandQueue(addr);
     } else {
-      this.log.info(`[BLE Bridge][${addr}] Device not connected, queuing command and initiating connection`);
-      if (!this.connecting.has(addr)) {
-        await this.connectToDevice(address);
+      // Avec la connexion proactive, on évite la connexion à la demande
+      if (BLE_PROACTIVE_CONNECTION) {
+        this.log.info(`[BLE Bridge][${addr}] Command queued, device will reconnect automatically via monitoring`);
+        // La reconnexion se fera automatiquement via monitorConnections()
+      } else {
+        // Comportement original : connexion à la demande
+        this.log.info(`[BLE Bridge][${addr}] Device not connected, queuing command and initiating connection`);
+        if (!this.connecting.has(addr)) {
+          await this.connectToDevice(address);
+        }
       }
     }
   }
