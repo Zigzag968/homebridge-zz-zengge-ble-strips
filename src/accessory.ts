@@ -253,9 +253,9 @@ export class ZenggeLedStripPlatformAccessory {
   }
 
   async sendCommand(command: Buffer) {
-    // Use platform.ble.sendCommand, converting buffer to hex
+    // Use platform.ble.sendCommandBuffer with Buffer support
     const prepared = this.preparePacket(command);
-    this.platform.ble.sendCommand(this.deviceAddress, prepared.toString('hex'));
+    await this.platform.ble.sendCommandBuffer(this.deviceAddress, prepared);
   }
 
   async setPower(value: boolean) {

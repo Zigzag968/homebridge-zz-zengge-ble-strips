@@ -1,181 +1,421 @@
+#!/usr/bin/env python3
 import asyncio
 import sys
 import json
+import signal
+import time
+from typing import Dict, List, Optional
 from bleak import BleakScanner, BleakClient
 
-wanted_devices = set()
-connected_clients = {}
-pending_commands = {}
+# Devices to watch, passed as command-line args (uppercase MACs)
+wanted_devices: set = set()
+# Connected clients: MAC -> {"client": BleakClient, "write_char": UUID}
+connected_clients: Dict[str, Dict[str, any]] = {}
+# Queued commands: MAC -> list of hex-string commands
+pending_commands: Dict[str, List[str]] = {}
+# Global shutdown flag
+shutdown_requested = False
 
-# UUIDs temporaires - seront découverts dynamiquement
-WRITE_CHAR_UUID = None
-NOTIFY_CHAR_UUID = None
-
-MAX_CONNECT_RETRIES = 5
-CONNECT_BACKOFF = 5  # seconds
-
-async def discover_characteristics(client, address):
-    """Découvre et affiche tous les services et caractéristiques"""
+async def force_disconnect_device(mac: str, client: BleakClient, timeout: float = 3.0):
+    """Force la déconnexion d'un périphérique avec timeout"""
     try:
-        print(f"=== DISCOVERING SERVICES FOR {address} ===", file=sys.stderr)
-        services = await client.get_services()
-        
-        write_char = None
-        notify_char = None
-        
-        for service in services:
-            print(f"Service: {service.uuid} ({service.description})", file=sys.stderr)
-            
-            for char in service.characteristics:
-                props = ", ".join(char.properties)
-                print(f"  Characteristic: {char.uuid} - Properties: [{props}]", file=sys.stderr)
-                
-                # Chercher une caractéristique avec propriété WRITE
-                if "write" in char.properties or "write-without-response" in char.properties:
-                    if not write_char:  # Prendre la première trouvée
-                        write_char = char.uuid
-                        print(f"    -> SELECTED as WRITE characteristic", file=sys.stderr)
-                
-                # Chercher une caractéristique avec propriété NOTIFY
-                if "notify" in char.properties:
-                    if not notify_char:  # Prendre la première trouvée
-                        notify_char = char.uuid
-                        print(f"    -> SELECTED as NOTIFY characteristic", file=sys.stderr)
-        
-        print(f"=== DISCOVERY COMPLETE FOR {address} ===", file=sys.stderr)
-        print(f"Selected WRITE: {write_char}", file=sys.stderr)
-        print(f"Selected NOTIFY: {notify_char}", file=sys.stderr)
-        
-        return write_char, notify_char
+        print(f"Force disconnecting {mac}...", file=sys.stderr, flush=True)
+        if client.is_connected:
+            # Utiliser asyncio.wait_for pour forcer un timeout
+            await asyncio.wait_for(client.disconnect(), timeout=timeout)
+            print(f"Successfully disconnected {mac}", file=sys.stderr, flush=True)
+        else:
+            print(f"Device {mac} was already disconnected", file=sys.stderr, flush=True)
+    except asyncio.TimeoutError:
+        print(f"Timeout disconnecting {mac}, device may be stuck", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"Error discovering characteristics for {address}: {e}", file=sys.stderr)
-        return None, None
+        print(f"Error disconnecting {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+async def cleanup_all_connections():
+    """Nettoie toutes les connexions avec timeouts et retry"""
+    print("Starting connection cleanup...", file=sys.stderr, flush=True)
+    
+    if not connected_clients:
+        print("No connections to clean up", file=sys.stderr, flush=True)
+        return
+    
+    # Créer une liste des tâches de déconnexion
+    disconnect_tasks = []
+    for mac, info in connected_clients.items():
+        client = info['client']
+        if client:
+            task = asyncio.create_task(force_disconnect_device(mac, client))
+            disconnect_tasks.append(task)
+    
+    if disconnect_tasks:
+        # Attendre toutes les déconnexions avec un timeout global
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*disconnect_tasks, return_exceptions=True),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            print("Global disconnect timeout reached, some devices may remain connected", file=sys.stderr, flush=True)
+    
+    # Vider le dictionnaire des clients connectés
+    connected_clients.clear()
+    print("Connection cleanup completed", file=sys.stderr, flush=True)
+
+async def discover_characteristics(client: BleakClient, address: str) -> (Optional[str], Optional[str]):
+    try:
+        services = await client.get_services()
+    except AttributeError:
+        # Fallback for bleak versions without get_services()
+        services = client.services
+    write_char = None
+    notify_char = None
+    for service in services:
+        for char in service.characteristics:
+            props = char.properties
+            if not write_char and ("write" in props or "write-without-response" in props):
+                write_char = char.uuid
+            if not notify_char and "notify" in props:
+                notify_char = char.uuid
+            if write_char and notify_char:
+                break
+        if write_char and notify_char:
+            break
+    return write_char, notify_char
+
+async def validate_connection(mac: str) -> bool:
+    """Valide que la connexion BLE est toujours active et fonctionnelle"""
+    if mac not in connected_clients:
+        return False
+    
+    client = connected_clients[mac]["client"]
+    try:
+        # Vérifier l'état de base de la connexion
+        if not client.is_connected:
+            print(f"Connection validation failed for {mac}: client not connected", file=sys.stderr, flush=True)
+            return False
+        
+        # Test simple : récupérer les services pour vérifier la communication
+        try:
+            services = await asyncio.wait_for(client.get_services(), timeout=5.0)
+            if not services:
+                print(f"Connection validation failed for {mac}: no services available", file=sys.stderr, flush=True)
+                return False
+        except asyncio.TimeoutError:
+            print(f"Connection validation failed for {mac}: services timeout", file=sys.stderr, flush=True)
+            return False
+        except AttributeError:
+            # Fallback pour les versions plus anciennes de bleak
+            services = client.services
+            if not services:
+                print(f"Connection validation failed for {mac}: no services available (fallback)", file=sys.stderr, flush=True)
+                return False
+        
+        print(f"Connection validation successful for {mac}", file=sys.stderr, flush=True)
+        return True
+        
+    except Exception as e:
+        print(f"Connection validation failed for {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return False
+
+async def write_ble_command(mac: str, command: str, send_feedback: bool = True) -> bool:
+    """
+    Fonction centralisée pour écrire une commande BLE avec gestion d'erreurs complète.
+    
+    Args:
+        mac: Adresse MAC du périphérique
+        command: Commande hexadécimale à envoyer
+        send_feedback: Si True, envoie des messages JSON de feedback
+    
+    Returns:
+        bool: True si l'écriture a réussi, False sinon
+    """
+    print(f"DEBUG: write_ble_command called for {mac} with command {command}", file=sys.stderr, flush=True)
+    
+    if mac not in connected_clients:
+        print(f"Device {mac} not in connected_clients", file=sys.stderr, flush=True)
+        if send_feedback:
+            error_msg = {"device": mac, "status": "error", "command": command, "error": "Device not connected"}
+            print(json.dumps(error_msg), flush=True)
+        return False
+    
+    client = connected_clients[mac]["client"]
+    write_char = connected_clients[mac]["write_char"]
+    
+    print(f"DEBUG: Client found for {mac}, is_connected: {client.is_connected if client else 'None'}", file=sys.stderr, flush=True)
+    print(f"DEBUG: Write characteristic: {write_char}", file=sys.stderr, flush=True)
+    
+    if not write_char:
+        print(f"No write characteristic for {mac}", file=sys.stderr, flush=True)
+        if send_feedback:
+            error_msg = {"device": mac, "status": "error", "command": command, "error": "No write characteristic"}
+            print(json.dumps(error_msg), flush=True)
+        return False
+    
+    try:
+        # Validation complète de la connexion avec timeout
+        print(f"DEBUG: Validating connection for {mac}", file=sys.stderr, flush=True)
+        if not await validate_connection(mac):
+            print(f"Connection validation failed for {mac}", file=sys.stderr, flush=True)
+            # Nettoyer la connexion défaillante
+            await force_disconnect_device(mac, client)
+            connected_clients.pop(mac, None)
+            if send_feedback:
+                error_msg = {"device": mac, "status": "error", "command": command, "error": "Connection validation failed"}
+                print(json.dumps(error_msg), flush=True)
+            return False
+        
+        print(f"DEBUG: About to write to {mac}", file=sys.stderr, flush=True)
+        print(f"Sending command to {mac}: {command}", file=sys.stderr, flush=True)
+        
+        # Écriture avec timeout pour éviter les blocages
+        await asyncio.wait_for(
+            client.write_gatt_char(write_char, bytes.fromhex(command)),
+            timeout=5.0
+        )
+        
+        print(f"DEBUG: Write completed successfully for {mac}", file=sys.stderr, flush=True)
+        print(f"Command sent successfully to {mac}", file=sys.stderr, flush=True)
+        
+        if send_feedback:
+            success_msg = {"device": mac, "status": "success", "command": command}
+            print(json.dumps(success_msg), flush=True)
+        
+        return True
+        
+    except asyncio.TimeoutError:
+        print(f"DEBUG: Write timeout for {mac}", file=sys.stderr, flush=True)
+        print(f"Write timeout for {mac}, connection may be stale", file=sys.stderr, flush=True)
+        # Nettoyer la connexion en timeout
+        await force_disconnect_device(mac, client)
+        connected_clients.pop(mac, None)
+        
+        if send_feedback:
+            error_msg = {"device": mac, "status": "error", "command": command, "error": "Write timeout"}
+            print(json.dumps(error_msg), flush=True)
+        
+        return False
+        
+    except Exception as e:
+        print(f"DEBUG: Write failed for {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        print(f"Failed to send command to {mac}: {e}", file=sys.stderr, flush=True)
+        # Nettoyer la connexion défaillante
+        await force_disconnect_device(mac, client)
+        connected_clients.pop(mac, None)
+        
+        if send_feedback:
+            error_msg = {"device": mac, "status": "error", "command": command, "error": str(e)}
+            print(json.dumps(error_msg), flush=True)
+        
+        return False
+
+async def process_command_batch(mac: str, commands: List[str]) -> int:
+    """
+    Traite un lot de commandes pour un périphérique donné.
+    
+    Args:
+        mac: Adresse MAC du périphérique
+        commands: Liste des commandes à envoyer
+    
+    Returns:
+        int: Nombre de commandes envoyées avec succès
+    """
+    if not commands:
+        return 0
+    
+    print(f"Processing batch of {len(commands)} commands for {mac}", file=sys.stderr, flush=True)
+    success_count = 0
+    
+    for i, command in enumerate(commands):
+        if shutdown_requested:
+            print(f"Shutdown requested, stopping batch processing for {mac}", file=sys.stderr, flush=True)
+            break
+            
+        success = await write_ble_command(mac, command, send_feedback=True)
+        if success:
+            success_count += 1
+        else:
+            print(f"Failed to send command {i+1}/{len(commands)} to {mac}, stopping batch", file=sys.stderr, flush=True)
+            # Remettre les commandes restantes en queue
+            remaining_commands = commands[i+1:]
+            if remaining_commands:
+                pending_commands.setdefault(mac, []).extend(remaining_commands)
+                print(f"Re-queued {len(remaining_commands)} remaining commands for {mac}", file=sys.stderr, flush=True)
+            break
+    
+    print(f"Batch processing complete for {mac}: {success_count}/{len(commands)} commands sent", file=sys.stderr, flush=True)
+    return success_count
+
+async def send_command(mac: str, command: str):
+    """
+    Interface publique pour envoyer une commande BLE.
+    Gère la mise en queue si le périphérique n'est pas connecté.
+    """
+    print(f"DEBUG: send_command called for {mac} with command {command}", file=sys.stderr, flush=True)
+    
+    if mac in connected_clients:
+        await write_ble_command(mac, command, send_feedback=True)
+    else:
+        print(f"Device {mac} not connected, queuing command", file=sys.stderr, flush=True)
+        pending_commands.setdefault(mac, []).append(command)
+        # Envoyer un feedback d'information
+        queue_msg = {"device": mac, "status": "queued", "command": command}
+        print(json.dumps(queue_msg), flush=True)
 
 async def stdin_listener():
-    loop = asyncio.get_event_loop()
+    # Read JSON commands from stdin
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-    while True:
-        line = await reader.readline()
-        if not line:
-            break
+    await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+    while not shutdown_requested:
         try:
-            message = json.loads(line.decode().strip())
-            device_id = message.get("device")
-            command = message.get("command")
-            if device_id in connected_clients:
-                client_info = connected_clients[device_id]
-                client = client_info["client"]
-                write_char = client_info["write_char"]
-                
-                if write_char:
-                    command_bytes = bytes.fromhex(command)
-                    print(f"Writing to {write_char}: {command}", file=sys.stderr)
-                    await client.write_gatt_char(write_char, command_bytes)
-                    print(f"Sent command to {device_id}: {command}", file=sys.stderr)
-                else:
-                    print(f"No write characteristic available for {device_id}", file=sys.stderr)
-            else:
-                # Queue the command for later sending
-                pending_commands[device_id] = command
-                print(f"Queued command for {device_id}: {command}", file=sys.stderr)
+            line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+            if not line:
+                break
+            msg = json.loads(line.decode().strip())
+            raw = msg.get("device")
+            cmd = msg.get("command")
+            if not raw or not cmd:
+                continue
+            mac = raw.upper()
+            await send_command(mac, cmd)
+        except asyncio.TimeoutError:
+            continue  # Timeout normal pour vérifier shutdown_requested
         except Exception as e:
-            print(f"Error processing input line: {e}", file=sys.stderr)
+            print(f"stdin processing: {e}", file=sys.stderr, flush=True)
 
-def notification_handler(sender, data):
-    # This function will be called when a notification is received
-    print(f"Notification from {sender}: {data.hex()}", file=sys.stderr)
-
-async def connect_and_manage(address):
-    retries = 0
-    while True:
+async def connect_and_manage(address: str):
+    mac = address.upper()
+    while not shutdown_requested:
+        print(f"Attempting to connect to {address.upper()}", file=sys.stderr, flush=True)
+        client = None
         try:
-            client = BleakClient(address)
-            await client.connect()
-            print(f"Connected to {address}", file=sys.stderr)
-
-            # Découvrir les caractéristiques disponibles
-            write_char, notify_char = await discover_characteristics(client, address)
+            client = BleakClient(mac)
+            # Connexion avec timeout
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+            print(f"Connected to {address.upper()}", file=sys.stderr, flush=True)
             
-            connected_clients[address] = {
-                "client": client,
-                "write_char": write_char,
-                "notify_char": notify_char
-            }
+            write_char, notify_char = await discover_characteristics(client, mac)
+            connected_clients[mac] = {"client": client, "write_char": write_char}
 
-            # Subscribe to notifications si disponible
+            # Subscribe to notifications
             if notify_char:
-                try:
-                    await client.start_notify(notify_char, notification_handler)
-                    print(f"Subscribed to notifications on {address} ({notify_char})", file=sys.stderr)
-                except Exception as e:
-                    print(f"Failed to subscribe to notifications on {address}: {e}", file=sys.stderr)
+                def notification_handler(sender, data):
+                    out = {"device": mac, "notification": data.hex()}
+                    print(json.dumps(out), flush=True)
+                await client.start_notify(notify_char, notification_handler)
 
-            # Send any pending command
-            if address in pending_commands and write_char:
-                command = pending_commands.pop(address)
-                command_bytes = bytes.fromhex(command)
-                print(f"Sending pending command to {write_char}: {command}", file=sys.stderr)
-                await client.write_gatt_char(write_char, command_bytes)
-                print(f"Sent pending command to {address}: {command}", file=sys.stderr)
+            # Send any queued commands using the batch processor
+            queued_commands = pending_commands.pop(mac, [])
+            if queued_commands:
+                await process_command_batch(mac, queued_commands)
 
-            # Monitor connection
-            while client.is_connected:
+            # Monitor connection until disconnect with periodic validation
+            validation_counter = 0
+            while client.is_connected and not shutdown_requested:
                 await asyncio.sleep(1)
-
-            print(f"Disconnected from {address}", file=sys.stderr)
-
+                validation_counter += 1
+                
+                # Valider la connexion toutes les 30 secondes
+                if validation_counter >= 30:
+                    validation_counter = 0
+                    if not await validate_connection(mac):
+                        print(f"Periodic validation failed for {mac}, forcing disconnect", file=sys.stderr, flush=True)
+                        break
+            print(f"Disconnected from {mac}", file=sys.stderr, flush=True)
+            
+        except asyncio.TimeoutError:
+            print(f"Connection timeout for {mac}", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"Failed to connect or manage device {address}: {e}", file=sys.stderr)
-
-        # Cleanup
-        if address in connected_clients:
-            try:
-                client_info = connected_clients[address]
-                client = client_info["client"]
-                if client.is_connected:
-                    await client.disconnect()
-            except Exception:
-                pass
-            del connected_clients[address]
-
-        retries += 1
-        if retries > MAX_CONNECT_RETRIES:
-            print(f"Max retries reached for {address}, giving up.", file=sys.stderr)
-            break
-
-        backoff_time = CONNECT_BACKOFF * retries
-        print(f"Retrying connection to {address} in {backoff_time} seconds...", file=sys.stderr)
-        await asyncio.sleep(backoff_time)
+            print(f"manage {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        finally:
+            if mac in connected_clients:
+                if client:
+                    await force_disconnect_device(mac, client)
+                connected_clients.pop(mac, None)
+        
+        # Wait before retrying (sauf si shutdown demandé)
+        if not shutdown_requested:
+            await asyncio.sleep(5)
 
 async def scan_loop():
-    while True:
-        print("Scanning for devices...", file=sys.stderr)
+    while not shutdown_requested:
+        print("Scanning for devices...", file=sys.stderr, flush=True)
         try:
-            devices = await BleakScanner.discover(timeout=5.0)
+            devices = await asyncio.wait_for(BleakScanner.discover(timeout=5.0), timeout=10.0)
+            print(f"Found {len(devices)} devices during scan", file=sys.stderr, flush=True)
+            for wanted in wanted_devices:
+                found = any(d.address.upper() == wanted for d in devices)
+                status = "found" if found else "not found"
+                print(f"Device {wanted} is {status}", file=sys.stderr, flush=True)
+            # Check for wanted devices
+            for d in devices:
+                mac = d.address.upper()
+                if mac in wanted_devices and mac not in connected_clients and not shutdown_requested:
+                    asyncio.create_task(connect_and_manage(mac))
+        except asyncio.TimeoutError:
+            print("Scan timeout, retrying...", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"Scan failed: {e}", file=sys.stderr)
-            await asyncio.sleep(5)
-            continue
+            print(f"scan: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        
+        # Attendre avant le prochain scan
+        for _ in range(10):  # 10 secondes par incréments de 1s
+            if shutdown_requested:
+                break
+            await asyncio.sleep(1)
 
-        for d in devices:
-            if d.address in wanted_devices and d.address not in connected_clients:
-                print(f"Found wanted device: {d.address} - {d.name}", file=sys.stderr)
-                asyncio.create_task(connect_and_manage(d.address))
-
-        await asyncio.sleep(10)
+def signal_handler(signum, frame):
+    """Gestionnaire de signaux pour un arrêt propre"""
+    global shutdown_requested
+    print(f"Received signal {signum}, initiating shutdown...", file=sys.stderr, flush=True)
+    shutdown_requested = True
 
 def main():
     global wanted_devices
-    if len(sys.argv) > 1:
-        wanted_devices = set(sys.argv[1:])
-    else:
-        print("No devices specified to watch.", file=sys.stderr)
+    wanted_devices = {addr.upper() for addr in sys.argv[1:]}
+    print(f"Watching devices: {wanted_devices}", file=sys.stderr, flush=True)
+    
+    # Configurer les gestionnaires de signaux
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     loop = asyncio.get_event_loop()
-    loop.create_task(stdin_listener())
-    loop.create_task(scan_loop())
-    loop.run_forever()
+    
+    async def main_async():
+        
+        # Démarrer les tâches principales
+        tasks = [
+            asyncio.create_task(stdin_listener()),
+            asyncio.create_task(scan_loop())
+        ]
+        
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"Main loop error: {e}", file=sys.stderr, flush=True)
+        finally:
+            # Nettoyage final
+            await cleanup_all_connections()
+    
+    try:
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        print("Keyboard interrupt received", file=sys.stderr, flush=True)
+    finally:
+        print("Shutting down bleDispatcher...", file=sys.stderr, flush=True)
+        
+        # Nettoyage final synchrone si nécessaire
+        if connected_clients:
+            loop.run_until_complete(cleanup_all_connections())
+        
+        # Cancel all pending tasks and wait for them to finish
+        pending_tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        if pending_tasks:
+            for task in pending_tasks:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending_tasks, return_exceptions=True))
+        
+        loop.close()
+        print("bleDispatcher shutdown complete", file=sys.stderr, flush=True)
 
 if __name__ == "__main__":
     main()

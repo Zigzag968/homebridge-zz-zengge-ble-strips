@@ -28,27 +28,13 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
     this.log = log;
     this.config = config;
     this.hap = homebridge.hap;
-    this.ble = new BleBridge();
+    this.ble = new BleBridge(log, config)
 
     homebridge.on('didFinishLaunching', () => {
-      this.launchPythonDispatcher();
       this.initializePlatform();
     });
   }
 
-  private launchPythonDispatcher() {
-    const pythonPath = path.resolve(__dirname, '..', 'ble-venv', 'bin', 'python3');
-    const scriptPath = path.resolve(__dirname, '..', 'scripts', 'bleDispatcher.py');
-    if (!fs.existsSync(pythonPath)) {
-      this.log.error(`[BLEAK] Python virtual environment not found at ${pythonPath}. Please reinstall the plugin.`);
-      return;
-    }
-    const child = spawn(pythonPath, [scriptPath], {
-      stdio: 'inherit',
-      detached: true
-    });
-    child.unref();
-  }
 
   private initializePlatform() {
     if (!this.config.devices) {
@@ -59,13 +45,8 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
 
     this.ble.start(this.config.devices.map((device: any) => device.address.toUpperCase()));
 
-    // Register each device in the BLE daemon by sending a dummy command
-    this.config.devices.forEach((deviceConfig: any) => {
-      const address = deviceConfig.address?.toUpperCase();
-      if (address) {
-        this.ble.sendCommand(address, '00'); // Inform daemon to track this device
-      }
-    });
+    // Note: Device registration will happen automatically when Python process starts
+    // No need to send commands immediately as the process is not ready yet
 
     this.config.devices.forEach((deviceConfig: any) => {
       const address = deviceConfig.address;
@@ -197,22 +178,9 @@ export class ZenggeLedStripPlatform implements DynamicPlatformPlugin {
     this.log.info(`Host Bluetooth enabled set to: ${this.bluetoothEnabled}`);
 
     if (this.bluetoothEnabled) {
-      exec('sudo /usr/local/bin/enable_bluetooth.sh', (error: Error | null, stdout: string, stderr: string) => {
-        if (error) {
-          this.log.error(`Error enabling Bluetooth: ${error.message}`);
-          return;
-        }
-        this.log.info('Bluetooth enable script executed.');
-      });
+      this.ble.enableBluetooth();
     } else {
-      exec('sudo /usr/local/bin/disable_bluetooth.sh', (error: Error | null, stdout: string, stderr: string) => {
-        if (error) {
-          this.log.error(`Error disabling Bluetooth: ${error.message}`);
-          return;
-        }
-        this.log.info('Bluetooth disable script executed.');
-        // Consider stopping noble scanning here if needed
-      });
+      this.ble.disableBluetooth();
     }
   }
 
