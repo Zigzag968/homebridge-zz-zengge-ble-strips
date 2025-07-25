@@ -7,6 +7,21 @@ import time
 from typing import Dict, List, Optional
 from bleak import BleakScanner, BleakClient
 
+
+# MagicHome BLE UUIDs
+MAGICHOME_SERVICE_UUID = "0000ffff-0000-1000-8000-00805f9b34fb"
+MAGICHOME_WRITE_UUID   = "0000ff01-0000-1000-8000-00805f9b34fb"
+MAGICHOME_NOTIFY_UUID  = "0000ff02-0000-1000-8000-00805f9b34fb"
+
+# Other firmware variants – valid write characteristics we accept
+LED_WRITE_UUIDS = {
+    "0000ff01-0000-1000-8000-00805f9b34fb",
+    "0000ffe9-0000-1000-8000-00805f9b34fb",
+    "0000ffd9-0000-1000-8000-00805f9b34fb",
+    "0000fff3-0000-1000-8000-00805f9b34fb",
+}
+
+
 # Devices to watch, passed as command-line args (uppercase MACs)
 wanted_devices: set = set()
 # Connected clients: MAC -> {"client": BleakClient, "write_char": UUID}
@@ -69,17 +84,41 @@ async def discover_characteristics(client: BleakClient, address: str) -> (Option
         services = client.services
     write_char = None
     notify_char = None
-    for service in services:
-        for char in service.characteristics:
-            props = char.properties
-            if not write_char and ("write" in props or "write-without-response" in props):
-                write_char = char.uuid
-            if not notify_char and "notify" in props:
-                notify_char = char.uuid
-            if write_char and notify_char:
-                break
+
+    # 1️⃣ Search for the known MagicHome service and characteristics
+    for svc in services:
+        if svc.uuid.lower() != MAGICHOME_SERVICE_UUID:
+            continue
+        for char in svc.characteristics:
+            uid = char.uuid.lower()
+            if uid == MAGICHOME_WRITE_UUID:
+                write_char = uid
+            elif uid == MAGICHOME_NOTIFY_UUID:
+                notify_char = uid
         if write_char and notify_char:
             break
+
+    # 2️⃣ Try the known LED_WRITE_UUIDS set
+    if not write_char or not notify_char:
+        for svc in services:
+            for char in svc.characteristics:
+                uid_lower = char.uuid.lower()
+                if not write_char and uid_lower in LED_WRITE_UUIDS:
+                    write_char = char.uuid
+                if not notify_char and "notify" in char.properties:
+                    notify_char = char.uuid
+            if write_char and notify_char:
+                break
+
+    # No generic fallback: log an error if still incomplete
+    if not write_char or not notify_char:
+        print(
+            f"Failed to discover required characteristics for {address} (write={write_char}, notify={notify_char})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    print(f"Using write_char {write_char}, notify_char {notify_char}", file=sys.stderr, flush=True)
     return write_char, notify_char
 
 async def validate_connection(mac: str) -> bool:
@@ -160,9 +199,10 @@ async def write_ble_command(mac: str, command: str, send_feedback: bool = True) 
         
         # Écriture avec timeout pour éviter les blocages
         await asyncio.wait_for(
-            client.write_gatt_char(write_char, bytes.fromhex(command)),
+            client.write_gatt_char(write_char, bytes.fromhex(command), response=True),
             timeout=5.0
         )
+        await asyncio.sleep(0.08)
         
         print(f"Command sent successfully to {mac}", file=sys.stderr, flush=True)
         
