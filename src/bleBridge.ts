@@ -179,16 +179,17 @@ export class BleBridge {
 
       this.log.info(`[BLE Bridge][${addr}] Initiating connection (attempt ${state.attempts})`);
 
-      // Send a dummy command to trigger connection in Python backend
-      await this.sendCommandWithPromise(addr, '00'); // Dummy command to establish connection
-
-      // Update state - the actual connection status will be managed by Python
-      state.connectionState = 'connected';
-      state.attempts = 0;
-      state.lastActivity = Date.now();
+      // Send connection command to Python backend
+      const connectCommand = {
+        action: "connect",
+        device: addr.toUpperCase()
+      };
       
-      this.devices.set(addr, state);
-      this.log.info(`[BLE Bridge][${addr}] Connection initiated successfully`);
+      this.pythonProcess!.stdin.write(JSON.stringify(connectCommand) + '\n');
+      this.log.info(`[BLE Bridge][${addr}] Connection request sent to Python backend`);
+
+      // Wait for connection confirmation from Python
+      await this.waitForConnectionConfirmation(addr);
 
       // Process any queued commands
       await this.processCommandQueue(addr);
@@ -205,7 +206,31 @@ export class BleBridge {
       this.connecting.delete(addr);
       this.connectionLock = false;
     }
-  }
+}
+/**
+ * Wait for connection confirmation from Python backend
+ */
+private async waitForConnectionConfirmation(addr: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      clearInterval(interval);
+      reject(new Error(`Connection timeout for ${addr}`));
+    }, 30000); // 30 seconds timeout
+    
+    const checkConnection = () => {
+      const state = this.devices.get(addr);
+      if (state?.connectionState === 'connected') {
+        clearTimeout(timeout);
+        clearInterval(interval);
+        resolve();
+      }
+    };
+    
+    // Check every 500ms for connection confirmation
+    const interval = setInterval(checkConnection, 500);
+  });
+}
+ 
 
   /**
    * Start Bluetooth scanning (compatible with bluetooth.ts interface)
@@ -323,6 +348,12 @@ export class BleBridge {
                 this.handleCommandError(deviceAddr, message.command, message.error);
               } else if (message.status === 'queued') {
                 this.log.warn(`[BLE PYTHON QUEUED] Command queued for ${message.device}: ${message.command}`);
+              } else if (message.status === 'connected') {
+                this.log.info(`[BLE PYTHON CONNECTED] Device ${message.device} connected`);
+                this.handleConnectionEvent(deviceAddr, 'connected', message.event);
+              } else if (message.status === 'disconnected') {
+                this.log.info(`[BLE PYTHON DISCONNECTED] Device ${message.device} disconnected`);
+                this.handleConnectionEvent(deviceAddr, 'disconnected', message.event);
               }
             } else {
               // Message de notification normale
@@ -417,6 +448,28 @@ export class BleBridge {
       state.retryCount++;
       this.devices.set(deviceAddr, state);
     }
+  }
+/**
+   * Handle connection events from Python backend
+   */
+  private handleConnectionEvent(deviceAddr: string, status: 'connected' | 'disconnected', event?: string): void {
+    const state = this.devices.get(deviceAddr);
+    if (!state) {
+      return;
+    }
+
+    if (status === 'connected') {
+      state.connectionState = 'connected';
+      state.lastActivity = Date.now();
+      state.attempts = 0;
+      state.retryCount = 0;
+      this.log.info(`[BLE Bridge][${deviceAddr}] Connection confirmed by Python backend (${event || 'unknown'})`);
+    } else if (status === 'disconnected') {
+      state.connectionState = 'disconnected';
+      this.log.info(`[BLE Bridge][${deviceAddr}] Disconnection confirmed by Python backend (${event || 'unknown'})`);
+    }
+
+    this.devices.set(deviceAddr, state);
   }
 
   /**

@@ -261,6 +261,102 @@ async def send_command(mac: str, command: str):
         queue_msg = {"device": mac, "status": "queued", "command": command}
         print(json.dumps(queue_msg), flush=True)
 
+async def scan_for_device(target_mac: str, timeout: float = 10.0) -> bool:
+    """Scan pour un device spécifique avec timeout"""
+    print(f"Scanning for specific device {target_mac}...", file=sys.stderr, flush=True)
+    try:
+        devices = await asyncio.wait_for(BleakScanner.discover(timeout=5.0), timeout=timeout)
+        found = any(d.address.upper() == target_mac for d in devices)
+        print(f"Device {target_mac} {'found' if found else 'not found'} in scan", file=sys.stderr, flush=True)
+        return found
+    except Exception as e:
+        print(f"Scan error for {target_mac}: {e}", file=sys.stderr, flush=True)
+        return False
+
+async def handle_successful_connection(mac: str, client: BleakClient):
+    """Gère une connexion réussie"""
+    try:
+        print(f"Connected to {mac}", file=sys.stderr, flush=True)
+        
+        write_char, notify_char = await discover_characteristics(client, mac)
+        connected_clients[mac] = {"client": client, "write_char": write_char}
+
+        # Subscribe to notifications
+        if notify_char:
+            def notification_handler(sender, data):
+                out = {"device": mac, "notification": data.hex()}
+                print(json.dumps(out), flush=True)
+            await client.start_notify(notify_char, notification_handler)
+
+        # Send connection confirmation
+        connection_msg = {"device": mac, "status": "connected", "event": "connection_established"}
+        print(json.dumps(connection_msg), flush=True)
+
+        # Send any queued commands using the batch processor
+        queued_commands = pending_commands.pop(mac, [])
+        if queued_commands:
+            await process_command_batch(mac, queued_commands)
+
+        # Monitor connection until disconnect with periodic validation
+        validation_counter = 0
+        while client.is_connected and not shutdown_requested:
+            await asyncio.sleep(1)
+            validation_counter += 1
+            
+            # Valider la connexion toutes les 30 secondes
+            if validation_counter >= 30:
+                validation_counter = 0
+                if not await validate_connection(mac):
+                    print(f"Periodic validation failed for {mac}, forcing disconnect", file=sys.stderr, flush=True)
+                    break
+        print(f"Disconnected from {mac}", file=sys.stderr, flush=True)
+        
+        # Send disconnection notification
+        disconnect_msg = {"device": mac, "status": "disconnected", "event": "connection_lost"}
+        print(json.dumps(disconnect_msg), flush=True)
+        
+    except Exception as e:
+        print(f"Error in connection handling for {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    finally:
+        if mac in connected_clients:
+            connected_clients.pop(mac, None)
+
+async def connect_on_demand(mac: str):
+    """Connexion à la demande avec scan préalable si nécessaire"""
+    if mac in connected_clients:
+        print(f"Device {mac} already connected", file=sys.stderr, flush=True)
+        return
+    
+    # Tentative de connexion directe d'abord
+    print(f"Attempting direct connection to {mac}...", file=sys.stderr, flush=True)
+    
+    try:
+        client = BleakClient(mac)
+        await asyncio.wait_for(client.connect(), timeout=10.0)
+        # Si ça marche, continuer avec la logique normale
+        await handle_successful_connection(mac, client)
+        
+    except Exception as e:
+        print(f"Direct connection failed for {mac}: {e}", file=sys.stderr, flush=True)
+        print(f"Trying scan-then-connect for {mac}...", file=sys.stderr, flush=True)
+        
+        # Si échec, faire un scan puis réessayer
+        if await scan_for_device(mac):
+            try:
+                client = BleakClient(mac)
+                await asyncio.wait_for(client.connect(), timeout=10.0)
+                await handle_successful_connection(mac, client)
+            except Exception as e2:
+                print(f"Connection failed even after scan for {mac}: {e2}", file=sys.stderr, flush=True)
+                # Send connection error
+                error_msg = {"device": mac, "status": "error", "event": "connection_failed", "error": str(e2)}
+                print(json.dumps(error_msg), flush=True)
+        else:
+            print(f"Device {mac} not discoverable", file=sys.stderr, flush=True)
+            # Send connection error
+            error_msg = {"device": mac, "status": "error", "event": "device_not_found", "error": "Device not discoverable"}
+            print(json.dumps(error_msg), flush=True)
+
 async def stdin_listener():
     # Read JSON commands from stdin
     reader = asyncio.StreamReader()
@@ -272,6 +368,33 @@ async def stdin_listener():
             if not line:
                 break
             msg = json.loads(line.decode().strip())
+            
+            # Handle control commands
+            if msg.get("action") == "connect":
+                mac = msg.get("device", "").upper()
+                if mac in wanted_devices and mac not in connected_clients:
+                    print(f"Manual connection requested for {mac}", file=sys.stderr, flush=True)
+                    asyncio.create_task(connect_on_demand(mac))
+                elif mac in connected_clients:
+                    print(f"Device {mac} already connected", file=sys.stderr, flush=True)
+                    # Send connection confirmation
+                    connection_msg = {"device": mac, "status": "connected", "event": "already_connected"}
+                    print(json.dumps(connection_msg), flush=True)
+                continue
+            
+            if msg.get("action") == "disconnect":
+                mac = msg.get("device", "").upper()
+                if mac in connected_clients:
+                    print(f"Manual disconnection requested for {mac}", file=sys.stderr, flush=True)
+                    client = connected_clients[mac]["client"]
+                    await force_disconnect_device(mac, client)
+                    connected_clients.pop(mac, None)
+                    # Send disconnection confirmation
+                    disconnect_msg = {"device": mac, "status": "disconnected", "event": "manual_disconnect"}
+                    print(json.dumps(disconnect_msg), flush=True)
+                continue
+            
+            # Handle BLE commands (existing logic)
             raw = msg.get("device")
             cmd = msg.get("command")
             if not raw or not cmd:
@@ -282,86 +405,6 @@ async def stdin_listener():
             continue  # Timeout normal pour vérifier shutdown_requested
         except Exception as e:
             print(f"stdin processing: {e}", file=sys.stderr, flush=True)
-
-async def connect_and_manage(address: str):
-    mac = address.upper()
-    while not shutdown_requested:
-        print(f"Attempting to connect to {address.upper()}", file=sys.stderr, flush=True)
-        client = None
-        try:
-            client = BleakClient(mac)
-            # Connexion avec timeout
-            await asyncio.wait_for(client.connect(), timeout=10.0)
-            print(f"Connected to {address.upper()}", file=sys.stderr, flush=True)
-            
-            write_char, notify_char = await discover_characteristics(client, mac)
-            connected_clients[mac] = {"client": client, "write_char": write_char}
-
-            # Subscribe to notifications
-            if notify_char:
-                def notification_handler(sender, data):
-                    out = {"device": mac, "notification": data.hex()}
-                    print(json.dumps(out), flush=True)
-                await client.start_notify(notify_char, notification_handler)
-
-            # Send any queued commands using the batch processor
-            queued_commands = pending_commands.pop(mac, [])
-            if queued_commands:
-                await process_command_batch(mac, queued_commands)
-
-            # Monitor connection until disconnect with periodic validation
-            validation_counter = 0
-            while client.is_connected and not shutdown_requested:
-                await asyncio.sleep(1)
-                validation_counter += 1
-                
-                # Valider la connexion toutes les 30 secondes
-                if validation_counter >= 30:
-                    validation_counter = 0
-                    if not await validate_connection(mac):
-                        print(f"Periodic validation failed for {mac}, forcing disconnect", file=sys.stderr, flush=True)
-                        break
-            print(f"Disconnected from {mac}", file=sys.stderr, flush=True)
-            
-        except asyncio.TimeoutError:
-            print(f"Connection timeout for {mac}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"manage {mac}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        finally:
-            if mac in connected_clients:
-                if client:
-                    await force_disconnect_device(mac, client)
-                connected_clients.pop(mac, None)
-        
-        # Wait before retrying (sauf si shutdown demandé)
-        if not shutdown_requested:
-            await asyncio.sleep(5)
-
-async def scan_loop():
-    while not shutdown_requested:
-        print("Scanning for devices...", file=sys.stderr, flush=True)
-        try:
-            devices = await asyncio.wait_for(BleakScanner.discover(timeout=5.0), timeout=10.0)
-            print(f"Found {len(devices)} devices during scan", file=sys.stderr, flush=True)
-            for wanted in wanted_devices:
-                found = any(d.address.upper() == wanted for d in devices)
-                status = "found" if found else "not found"
-                print(f"Device {wanted} is {status}", file=sys.stderr, flush=True)
-            # Check for wanted devices
-            for d in devices:
-                mac = d.address.upper()
-                if mac in wanted_devices and mac not in connected_clients and not shutdown_requested:
-                    asyncio.create_task(connect_and_manage(mac))
-        except asyncio.TimeoutError:
-            print("Scan timeout, retrying...", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"scan: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        
-        # Attendre avant le prochain scan
-        for _ in range(10):  # 10 secondes par incréments de 1s
-            if shutdown_requested:
-                break
-            await asyncio.sleep(1)
 
 def signal_handler(signum, frame):
     """Gestionnaire de signaux pour un arrêt propre"""
@@ -381,11 +424,9 @@ def main():
     loop = asyncio.get_event_loop()
     
     async def main_async():
-        
-        # Démarrer les tâches principales
+        # Démarrer uniquement stdin_listener - pas de scan automatique
         tasks = [
             asyncio.create_task(stdin_listener()),
-            asyncio.create_task(scan_loop())
         ]
         
         try:
