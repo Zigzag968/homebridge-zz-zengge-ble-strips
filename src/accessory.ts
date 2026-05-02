@@ -45,7 +45,7 @@ export class ZenggeLedStripPlatformAccessory {
 
   // Valeurs primaires issues du service principal (HSV)
   private primaryHue: number = 0;
-  private primarySaturation: number = 100;
+  private primarySaturation: number = 0;
   private primaryBrightness: number = 100;
 
   constructor(
@@ -59,6 +59,12 @@ export class ZenggeLedStripPlatformAccessory {
     this.name = config.name || 'Zengge LED Strip';
     this.deviceAddress = config.address;
     this.accessory = accessory;
+
+    // Restaurer les valeurs primaires persistées (défaut : blanc pur)
+    this.primaryHue = accessory.context.primaryHue ?? 0;
+    this.primarySaturation = accessory.context.primarySaturation ?? 0;
+    this.primaryBrightness = accessory.context.primaryBrightness ?? 100;
+
     this.log('Accessory initialized:', this.name);
   }
 
@@ -128,12 +134,16 @@ export class ZenggeLedStripPlatformAccessory {
 
     this.onService.setPrimaryService(true);
     this.onService.updateCharacteristic(this.platform.hap.Characteristic.On, this.isOn);
-    this.log(`Service Power (primary) created for ${this.name}`);
+    this.onService.updateCharacteristic(this.platform.hap.Characteristic.Hue, this.primaryHue);
+    this.onService.updateCharacteristic(this.platform.hap.Characteristic.Saturation, this.primarySaturation);
+    this.onService.updateCharacteristic(this.platform.hap.Characteristic.Brightness, this.primaryBrightness);
+    this.log(`Service Power (primary) created for ${this.name}, default color: H=${this.primaryHue} S=${this.primarySaturation} B=${this.primaryBrightness}`);
   }
 
   // Callbacks pour mettre à jour les valeurs primaires (HSV)
   async setPrimaryHue(value: CharacteristicValue): Promise<void> {
     this.primaryHue = value as number;
+    this.accessory.context.primaryHue = this.primaryHue;
     this.onService.updateCharacteristic(this.platform.hap.Characteristic.Hue, this.primaryHue);
     this.log(`Primary Hue updated: ${this.primaryHue}`);
     this.updateActiveColorStops();
@@ -142,6 +152,7 @@ export class ZenggeLedStripPlatformAccessory {
 
   async setPrimarySaturation(value: CharacteristicValue): Promise<void> {
     this.primarySaturation = value as number;
+    this.accessory.context.primarySaturation = this.primarySaturation;
     this.onService.updateCharacteristic(this.platform.hap.Characteristic.Saturation, this.primarySaturation);
     this.log(`Primary Saturation updated: ${this.primarySaturation}`);
     this.updateActiveColorStops();
@@ -150,6 +161,7 @@ export class ZenggeLedStripPlatformAccessory {
 
   async setPrimaryBrightness(value: CharacteristicValue): Promise<void> {
     this.primaryBrightness = value as number;
+    this.accessory.context.primaryBrightness = this.primaryBrightness;
     this.onService.updateCharacteristic(this.platform.hap.Characteristic.Brightness, this.primaryBrightness);
     this.log(`Primary Brightness updated: ${this.primaryBrightness}`);
     this.updateActiveColorStops();
@@ -274,7 +286,15 @@ export class ZenggeLedStripPlatformAccessory {
     await this.setPower(value as boolean);
     if (value === true) {
       // Augmentez le délai pour vous assurer que le ruban a bien alimenté
-      await new Promise(resolve => setTimeout(resolve, 500)); // Passez de 500ms à 1000ms
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // Si aucun color stop n'est actif, appliquer la couleur primaire (picker HomeKit)
+      const hasActiveStops = this.colorStops.some(stop => stop.isOn);
+      if (!hasActiveStops) {
+        this.log('No active color stops, applying primary color as default');
+        this.updateActiveColorStops();
+      }
+
       await this.scheduleGradientUpdate();
     }
   }
